@@ -1,0 +1,7 @@
+Replace these with real icons:
+- public/pwa-192.png  (192x192)
+- public/pwa-512.png  (512x512)  
+- public/apple-touch-icon.png (180x180)
+- public/favicon.ico
+
+Use https://realfavicongenerator.net to generate all sizes from one image.
