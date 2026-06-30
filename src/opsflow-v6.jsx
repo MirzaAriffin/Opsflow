@@ -506,14 +506,93 @@ function useSyncingIndicator() {
   return syncing;
 }
 
+// Pull-to-refresh: since Firestore data is already live (onSnapshot keeps everything current),
+// there's nothing to actually re-fetch — this is a physical confirmation gesture for the user
+// ("yes, the app is responsive and your data is current"), not a real network refetch.
+// overscroll-behavior:none is already set globally in index.html, so the browser's own
+// native bounce/refresh is suppressed, leaving a clean gesture surface for this.
+const PULL_THRESHOLD = 70;
+function usePullToRefresh(containerRef) {
+  const [pullDistance, setPullDistance] = useState(0);
+  const [refreshed, setRefreshed] = useState(false);
+  const touchStartY = useRef(null);
+  const isPulling = useRef(false);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const onTouchStart = (e) => {
+      if (window.scrollY <= 0) {
+        touchStartY.current = e.touches[0].clientY;
+        isPulling.current = true;
+      }
+    };
+    const onTouchMove = (e) => {
+      if (!isPulling.current || touchStartY.current === null) return;
+      const delta = e.touches[0].clientY - touchStartY.current;
+      if (delta > 0 && window.scrollY <= 0) {
+        setPullDistance(Math.min(delta * 0.5, 100)); // damped, capped so it never feels like the screen is being yanked off
+      } else {
+        isPulling.current = false;
+        setPullDistance(0);
+      }
+    };
+    const onTouchEnd = () => {
+      if (isPulling.current && pullDistance >= PULL_THRESHOLD) {
+        setRefreshed(true);
+        setTimeout(() => setRefreshed(false), 1200);
+      }
+      isPulling.current = false;
+      touchStartY.current = null;
+      setPullDistance(0);
+    };
+
+    el.addEventListener("touchstart", onTouchStart, { passive: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: true });
+    el.addEventListener("touchend", onTouchEnd, { passive: true });
+    return () => {
+      el.removeEventListener("touchstart", onTouchStart);
+      el.removeEventListener("touchmove", onTouchMove);
+      el.removeEventListener("touchend", onTouchEnd);
+    };
+  }, [containerRef, pullDistance]);
+
+  return { pullDistance, refreshed, isReady: pullDistance >= PULL_THRESHOLD };
+}
+
 function Shell({ children }) {
   const syncing = useSyncingIndicator();
+  const shellRef = useRef(null);
+  const { pullDistance, refreshed, isReady } = usePullToRefresh(shellRef);
+  // env(safe-area-inset-top) only returns a real, non-zero value inside an installed PWA on
+  // a notched device. In a regular browser tab — or on devices/browsers where it doesn't
+  // resolve cleanly — it returns 0, and CSS's own fallback syntax (env(x, 16px)) only kicks
+  // in when the property is unsupported entirely, not when it resolves to 0. Using max() here
+  // guarantees real clearance under the status bar in every case, not just the PWA-installed one.
+  const safeTop = "max(env(safe-area-inset-top, 0px), 28px)";
+  const safeBottom = "max(env(safe-area-inset-bottom, 0px), 20px)";
   return (
-    <div style={{ minHeight:"100vh", background:CANVAS, fontFamily:"'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", display:"flex", justifyContent:"center", paddingTop:"env(safe-area-inset-top, 16px)", paddingBottom:"env(safe-area-inset-bottom, 24px)", paddingLeft:"env(safe-area-inset-left, 0px)", paddingRight:"env(safe-area-inset-right, 0px)" }}>
-      <div style={{ width:"100%", maxWidth:420, padding:"16px 16px 40px", position:"relative" }}>
+    <div ref={shellRef} style={{ minHeight:"100vh", background:CANVAS, fontFamily:"'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", display:"flex", justifyContent:"center", paddingTop:safeTop, paddingBottom:safeBottom, paddingLeft:"env(safe-area-inset-left, 0px)", paddingRight:"env(safe-area-inset-right, 0px)" }}>
+      <div style={{ width:"100%", maxWidth:420, padding:"16px 16px 40px", position:"relative", transform: pullDistance > 0 ? `translateY(${pullDistance}px)` : "none", transition: pullDistance === 0 ? "transform 0.25s ease-out" : "none" }}>
         <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+        {(pullDistance > 0 || refreshed) && (
+          <div style={{ position:"absolute", top:-46, left:"50%", transform:"translateX(-50%)", display:"flex", alignItems:"center", gap:6, opacity: refreshed ? 1 : Math.min(pullDistance / PULL_THRESHOLD, 1) }}>
+            {refreshed ? (
+              <>
+                <CheckCircle2 size={14} color={GREEN_DARK} />
+                <span style={{ fontSize:11.5, fontWeight:600, color:GREEN_DARK }}>Up to date</span>
+              </>
+            ) : (
+              <>
+                <div style={{ width:14, height:14, borderRadius:"50%", border:`2px solid ${BORDER}`, borderTop:`2px solid ${isReady?BLUE:SLATE_LIGHT}`, transform:`rotate(${pullDistance*3}deg)` }} />
+                <span style={{ fontSize:11.5, fontWeight:600, color: isReady ? BLUE : SLATE_LIGHT }}>{isReady ? "Release to refresh" : "Pull to refresh"}</span>
+              </>
+            )}
+          </div>
+        )}
         {syncing && (
-          <div style={{ position:"fixed", top:"calc(env(safe-area-inset-top, 16px) + 10px)", left:"50%", transform:"translateX(-50%)", zIndex:9998, display:"flex", alignItems:"center", gap:7, background:"rgba(17,24,39,0.88)", backdropFilter:"blur(4px)", color:"white", fontSize:11.5, fontWeight:600, padding:"7px 14px", borderRadius:20, boxShadow:"0 4px 14px rgba(17,24,39,0.25)" }}>
+          <div style={{ position:"fixed", top:`calc(${safeTop} + 10px)`, left:"50%", transform:"translateX(-50%)", zIndex:9998, display:"flex", alignItems:"center", gap:7, background:"rgba(17,24,39,0.88)", backdropFilter:"blur(4px)", color:"white", fontSize:11.5, fontWeight:600, padding:"7px 14px", borderRadius:20, boxShadow:"0 4px 14px rgba(17,24,39,0.25)" }}>
             <div style={{ width:11, height:11, borderRadius:"50%", border:"2px solid rgba(255,255,255,0.3)", borderTop:"2px solid white", animation:"spin 0.7s linear infinite" }} />
             Saving…
           </div>
@@ -524,8 +603,17 @@ function Shell({ children }) {
   );
 }
 
+function SectionLabel({ children, accent }) {
+  return (
+    <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom:11 }}>
+      <div style={{ width:3, height:13, borderRadius:2, background: accent || SLATE_LIGHT }} />
+      <div style={{ fontSize:11, fontWeight:800, color:SLATE, textTransform:"uppercase", letterSpacing:0.7 }}>{children}</div>
+    </div>
+  );
+}
+
 function tileStyle() {
-  return { width:"100%", display:"flex", alignItems:"center", gap:14, padding:18, borderRadius:16, border:`1px solid ${BORDER}`, background:"white", marginBottom:10, cursor:"pointer", textAlign:"left", boxShadow:"0 1px 3px rgba(16,24,40,0.04)" };
+  return { width:"100%", display:"flex", alignItems:"center", gap:14, padding:18, borderRadius:16, border:`1px solid ${BORDER}`, background:"white", marginBottom:10, cursor:"pointer", textAlign:"left", boxShadow:"0 1px 2px rgba(16,24,40,0.04), 0 1px 6px rgba(16,24,40,0.03)" };
 }
 const tileIconStyle = { width:46, height:46, borderRadius:13, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 };
 const tileTitleStyle = { display:"block", fontSize:15, fontWeight:700, color:INK };
@@ -625,19 +713,10 @@ function FiledStatusCard({ entry: e, isReviewer, onApprove, onReject, onUndo, on
               </div>
             )}
 
-            {/* Crew & vehicles */}
-            {(e.vehicles?.length > 0 || e.crew?.length > 0) && (
-              <div style={{ marginBottom:10 }}>
-                {e.vehicles?.length > 0 && (
-                  <div style={{ fontSize:11, color:SLATE, marginBottom:5 }}>
-                    <strong>Vehicles:</strong> {e.vehicles.join(", ")}
-                  </div>
-                )}
-                {e.crew?.length > 0 && (
-                  <div style={{ fontSize:11, color:SLATE, marginBottom:5 }}>
-                    <strong>Crew:</strong> {e.crew.join(", ")}
-                  </div>
-                )}
+            {/* Vehicles — crew already shown in the always-visible summary above, no need to repeat it here */}
+            {e.vehicles?.length > 0 && (
+              <div style={{ marginBottom:10, fontSize:11, color:SLATE }}>
+                <strong>Vehicles:</strong> {e.vehicles.join(", ")}
               </div>
             )}
 
@@ -901,27 +980,33 @@ function ConfirmModal({ title, body, confirmLabel = "Confirm", confirmColor = RE
 function AppHeader({ session, onLogout }) {
   const roleLabel = session.role==="admin"?"Admin":session.role==="supervisor"?"Supervisor":session.role==="beta"?"Beta Tester":`${teamLabel(session.team)} Team`;
   const initials = session.name.split(" ").map((w)=>w[0]).slice(0,2).join("").toUpperCase();
+  const roleAccent = session.role==="admin"?PURPLE:session.role==="supervisor"?AMBER:session.role==="beta"?"#A78BFA":teamAccent(session.team);
   const [showLogout, setShowLogout] = useState(false);
   return (
     <>
       {showLogout && <LogoutModal onConfirm={() => { setShowLogout(false); onLogout(); }} onCancel={() => setShowLogout(false)} />}
-      <div style={{ borderRadius:18, padding:"20px 18px 16px", marginBottom:16, background:`linear-gradient(135deg, ${BLUE_DARKER} 0%, ${BLUE_DARK} 55%, ${BLUE} 100%)`, boxShadow:`0 10px 28px ${BLUE_DARKER}40`, position:"relative", overflow:"hidden" }}>
+      <div style={{ borderRadius:20, padding:"22px 18px 16px", marginBottom:16, background:`linear-gradient(135deg, ${BLUE_DARKER} 0%, ${BLUE_DARK} 55%, ${BLUE} 100%)`, boxShadow:`0 12px 32px ${BLUE_DARKER}45`, position:"relative", overflow:"hidden" }}>
         {/* Decorative circles */}
-        <div style={{ position:"absolute", top:-40, right:-40, width:140, height:140, borderRadius:"50%", background:"rgba(255,255,255,0.05)" }} />
-        <div style={{ position:"absolute", bottom:-30, left:-20, width:100, height:100, borderRadius:"50%", background:"rgba(255,255,255,0.03)" }} />
+        <div style={{ position:"absolute", top:-44, right:-44, width:150, height:150, borderRadius:"50%", background:"rgba(255,255,255,0.05)" }} />
+        <div style={{ position:"absolute", bottom:-34, left:-22, width:110, height:110, borderRadius:"50%", background:"rgba(255,255,255,0.03)" }} />
         {/* Centred wordmark */}
-        <div style={{ textAlign:"center", marginBottom:16, position:"relative" }}>
-          <div style={{ fontSize:26, fontWeight:900, color:"white", letterSpacing:-0.6, lineHeight:1 }}>OPSFLOW</div>
-          <div style={{ fontSize:10.5, color:"rgba(255,255,255,0.5)", fontWeight:600, letterSpacing:0.5, marginTop:3 }}>AIMFLOW PTE LTD · FIELD OPERATIONS</div>
+        <div style={{ textAlign:"center", marginBottom:17, position:"relative" }}>
+          <div style={{ fontSize:27, fontWeight:900, color:"white", letterSpacing:-0.7, lineHeight:1 }}>OPSFLOW</div>
+          <div style={{ fontSize:10, color:"rgba(255,255,255,0.5)", fontWeight:600, letterSpacing:0.7, marginTop:4 }}>AIMFLOW PTE LTD · FIELD OPERATIONS</div>
         </div>
         {/* User row */}
-        <div style={{ display:"flex", alignItems:"center", gap:10, position:"relative", background:"rgba(255,255,255,0.08)", borderRadius:12, padding:"10px 12px" }}>
-          <div style={{ width:36, height:36, borderRadius:10, background:"rgba(255,255,255,0.18)", border:"1px solid rgba(255,255,255,0.2)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:12, fontWeight:800, color:"white", flexShrink:0 }}>{initials}</div>
+        <div style={{ display:"flex", alignItems:"center", gap:11, position:"relative", background:"rgba(255,255,255,0.07)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:14, padding:"11px 13px" }}>
+          <div style={{ width:38, height:38, borderRadius:11, background:`linear-gradient(135deg, ${roleAccent}, ${roleAccent}99)`, padding:1.5, flexShrink:0 }}>
+            <div style={{ width:"100%", height:"100%", borderRadius:9.5, background:BLUE_DARKER, display:"flex", alignItems:"center", justifyContent:"center", fontSize:12.5, fontWeight:800, color:"white" }}>{initials}</div>
+          </div>
           <div style={{ flex:1, minWidth:0 }}>
             <div style={{ fontSize:14, fontWeight:700, color:"white", lineHeight:1.2 }}>{session.name}</div>
-            <div style={{ fontSize:11, color:"rgba(255,255,255,0.6)", fontWeight:600, marginTop:1 }}>{roleLabel}</div>
+            <div style={{ display:"flex", alignItems:"center", gap:5, marginTop:2 }}>
+              <span style={{ width:5, height:5, borderRadius:"50%", background:roleAccent }} />
+              <span style={{ fontSize:10.5, color:"rgba(255,255,255,0.65)", fontWeight:600 }}>{roleLabel}</span>
+            </div>
           </div>
-          <button onClick={() => setShowLogout(true)} style={{ display:"flex", alignItems:"center", gap:5, border:"1px solid rgba(255,255,255,0.25)", background:"rgba(255,255,255,0.08)", borderRadius:9, padding:"7px 11px", cursor:"pointer", fontSize:11, fontWeight:600, color:"white", flexShrink:0 }}>
+          <button onClick={() => setShowLogout(true)} style={{ display:"flex", alignItems:"center", gap:5, border:"1px solid rgba(255,255,255,0.18)", background:"rgba(255,255,255,0.06)", borderRadius:10, padding:"8px 12px", cursor:"pointer", fontSize:11, fontWeight:600, color:"white", flexShrink:0 }}>
             <LogOut size={12} /> Log out
           </button>
         </div>
@@ -1020,7 +1105,30 @@ export default function AimflowMasterApp() {
 
   // ── Session state ─────────────────────────────────────────────────
   const [session, setSession] = useState(null);
-  const [screen, setScreen] = useState("landing");
+  const [screen, setScreenRaw] = useState("landing");
+  // Navigation history stack — lets the back button always return to wherever the user
+  // actually came from, instead of a hardcoded "normal flow" destination. This matters
+  // because some screens are reachable from more than one place (e.g. fuelLogVehicle from
+  // both the team-logs flow AND directly from a dashboard shortcut) — a hardcoded back
+  // button only knows the "usual" path, so it can send you somewhere you didn't come from.
+  const screenHistoryRef = useRef([]);
+  const setScreen = useCallback((next) => {
+    setScreenRaw((current) => {
+      if (current !== next) screenHistoryRef.current = [...screenHistoryRef.current, current];
+      return next;
+    });
+  }, []);
+  const goBack = useCallback((fallback) => {
+    setScreenRaw(() => {
+      const hist = screenHistoryRef.current;
+      if (hist.length > 0) {
+        const prev = hist[hist.length - 1];
+        screenHistoryRef.current = hist.slice(0, -1);
+        return prev;
+      }
+      return fallback || "landing";
+    });
+  }, []);
   const lastActivityRef = useRef(Date.now());
 
   // ── Transient UI state ────────────────────────────────────────────
@@ -1131,7 +1239,7 @@ export default function AimflowMasterApp() {
   const nowFn = () => { if(isBeta&&draft.manualCheckIn){const t=new Date(draft.manualCheckIn).getTime();if(!isNaN(t))return t;} return Date.now(); };
   const checkoutNowFn = () => { if(isBeta&&checkoutDraft.manualCheckOut){const t=new Date(checkoutDraft.manualCheckOut).getTime();if(!isNaN(t))return t;} return Date.now(); };
   const handleLogin = (user) => { lastActivityRef.current=Date.now(); setSession(user); setScreen("landing"); };
-  const handleLogout = () => { setSession(null); setScreen("landing"); setDraft(emptyDraft()); setCheckoutDraft(emptyCheckout()); setFuelDraft(emptyFuelDraft()); setLogPersonName(null); setLogVehicleName(null); setLogTeamFilter(null); };
+  const handleLogout = () => { screenHistoryRef.current = []; setSession(null); setScreenRaw("landing"); setDraft(emptyDraft()); setCheckoutDraft(emptyCheckout()); setFuelDraft(emptyFuelDraft()); setLogPersonName(null); setLogVehicleName(null); setLogTeamFilter(null); };
 
   // ── Firestore write helpers ───────────────────────────────────────
   const fsOp = async (fn) => {
@@ -1342,7 +1450,7 @@ export default function AimflowMasterApp() {
         {/* Informational badge — I'm listed as crew on someone else's currently active job.
             Read-only: no lock, no checkout access. I can still independently check into a different job. */}
         {myCrewActiveJobs.length > 0 && myCrewActiveJobs.map((j) => (
-          <div key={j.id} style={{ display:"flex", alignItems:"center", gap:12, background:`linear-gradient(135deg, ${BLUE}, ${BLUE_DARK})`, borderRadius:14, padding:"14px 16px", marginBottom:14, boxShadow:`0 8px 20px ${BLUE_DARK}30` }}>
+          <div key={j.id} style={{ display:"flex", alignItems:"center", gap:12, background:`linear-gradient(135deg, ${PURPLE}, #4C2E94)`, borderRadius:14, padding:"14px 16px", marginBottom:14, boxShadow:`0 8px 20px ${PURPLE}35` }}>
             <div style={{ width:38, height:38, borderRadius:11, background:"rgba(255,255,255,0.18)", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
               <Users size={18} color="white" />
             </div>
@@ -1423,19 +1531,19 @@ export default function AimflowMasterApp() {
         {/* My hours summary */}
         {(isWorker || isSupervisor) && myCumulative.hours > 0 && (
           <div style={{ display:"flex", gap:10, marginBottom:16 }}>
-            <div style={{ flex:1, background:"white", border:`1px solid ${BORDER}`, borderRadius:13, padding:"12px 14px" }}>
-              <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:4 }}><Clock size={12} color={BLUE} /><span style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3 }}>MY TOTAL HRS</span></div>
-              <div style={{ fontSize:18, fontWeight:800, color:INK }}>{myCumulative.hours.toFixed(1)}</div>
+            <div style={{ flex:1, background:BLUE_LIGHT, border:`1px solid ${BLUE}22`, borderRadius:14, padding:"13px 14px" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:5 }}><Clock size={12} color={BLUE} /><span style={{ fontSize:10, color:BLUE_DARK, fontWeight:700, letterSpacing:0.4 }}>MY TOTAL HRS</span></div>
+              <div style={{ fontSize:21, fontWeight:800, color:BLUE_DARK, letterSpacing:-0.3 }}>{myCumulative.hours.toFixed(1)}</div>
             </div>
-            <div style={{ flex:1, background:"white", border:`1px solid ${BORDER}`, borderRadius:13, padding:"12px 14px" }}>
-              <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:4 }}><TrendingUp size={12} color={AMBER} /><span style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3 }}>TENTATIVE OT</span></div>
-              <div style={{ fontSize:18, fontWeight:800, color:INK }}>{myCumulative.ot.toFixed(1)}</div>
+            <div style={{ flex:1, background:AMBER_LIGHT, border:`1px solid ${AMBER}22`, borderRadius:14, padding:"13px 14px" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:5 }}><TrendingUp size={12} color={AMBER_DARK} /><span style={{ fontSize:10, color:AMBER_DARK, fontWeight:700, letterSpacing:0.4 }}>TENTATIVE OT</span></div>
+              <div style={{ fontSize:21, fontWeight:800, color:AMBER_DARK, letterSpacing:-0.3 }}>{myCumulative.ot.toFixed(1)}</div>
             </div>
           </div>
         )}
 
         {/* Quick actions */}
-        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:10, textTransform:"uppercase", letterSpacing:0.5 }}>Quick actions</div>
+        <SectionLabel accent={BLUE}>Quick actions</SectionLabel>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:10 }}>
           <button onClick={()=>setScreen("checkinoutTeam")} style={{ display:"flex", flexDirection:"column", alignItems:"flex-start", gap:8, padding:16, borderRadius:16, border:`1.5px solid ${BLUE}22`, background:BLUE_LIGHT, cursor:"pointer", textAlign:"left", boxShadow:`0 2px 8px ${BLUE}18` }}>
             <span style={{ width:40, height:40, borderRadius:12, background:BLUE, display:"flex", alignItems:"center", justifyContent:"center" }}><ClipboardList size={20} color="white" /></span>
@@ -1448,7 +1556,7 @@ export default function AimflowMasterApp() {
         </div>
 
         {/* My tools section */}
-        <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"16px 0 10px", textTransform:"uppercase", letterSpacing:0.5 }}>My tools</div>
+        <SectionLabel accent={PURPLE}>My tools</SectionLabel>
 
         {(isWorker || isSupervisor) && (
           <button onClick={()=>{setLogPersonName(null);setLogVehicleName(null);setLogTeamFilter(null);setScreen("myJobLog");}} style={tileStyle()}>
@@ -1458,9 +1566,9 @@ export default function AimflowMasterApp() {
         )}
 
         {isWorker && (
-          <button onClick={()=>{setLogPersonName(null);setScreen("personnelLog");}} style={tileStyle()}>
+          <button onClick={()=>{setLogTeamFilter(session.team);setScreen("jobLogView");}} style={tileStyle()}>
             <span style={{ ...tileIconStyle, background:PURPLE_LIGHT }}><Users size={22} color={PURPLE} /></span>
-            <span style={{ flex:1 }}><span style={tileTitleStyle}>Team logs</span><span style={tileSubStyle}>Team totals and teammates' job history</span></span>
+            <span style={{ flex:1 }}><span style={tileTitleStyle}>Team logs</span><span style={tileSubStyle}>See your team's job activity</span></span>
           </button>
         )}
 
@@ -1480,7 +1588,7 @@ export default function AimflowMasterApp() {
         {/* Team section — supervisors & admin */}
         {isTeamLead && !isBeta && (
           <>
-            <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"16px 0 10px", textTransform:"uppercase", letterSpacing:0.5 }}>Team</div>
+            <SectionLabel accent={AMBER}>Team</SectionLabel>
 
             {/* Review filed entries — always visible, badge shows pending count */}
             <button onClick={()=>{setScreen("reviewQueue");}} style={{ ...tileStyle(), ...(pendingCount > 0 ? { border:`1.5px solid #C2570C`, background:"#FEF0E6" } : {}) }}>
@@ -1497,21 +1605,21 @@ export default function AimflowMasterApp() {
             </button>
 
             {/* Team last-job cards */}
-            <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"12px 0 8px", textTransform:"uppercase", letterSpacing:0.5 }}>Last completed job by team</div>
+            <SectionLabel accent={GREEN_DARK}>Last completed job by team</SectionLabel>
             {(isAdmin ? ["tanker","jetting","watertank"] : mySupTeams).map((t) => (
               <TeamLastJobCard key={t} team={t} jobHistory={jobHistory} filedEntries={filedEntries}
                 onClick={()=>{setLogTeamFilter(t);setScreen("jobLogView");}} />
             ))}
 
             {/* Team last-fuel cards */}
-            <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"12px 0 8px", textTransform:"uppercase", letterSpacing:0.5 }}>Last fill-up by team</div>
+            <SectionLabel accent={AMBER_DARK}>Last fill-up by team</SectionLabel>
             {(isAdmin ? ["tanker","jetting","watertank"] : mySupTeams).map((t) => (
               <TeamLastFuelCard key={t} team={t} fuelHistory={fuelHistory}
                 onClick={()=>{setLogTeamFilter(t);setLogVehicleName(null);setScreen("fuelLogVehicle");}} />
             ))}
 
             {/* Team hours overview */}
-            <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"12px 0 8px", textTransform:"uppercase", letterSpacing:0.5 }}>Team hours overview</div>
+            <SectionLabel accent={BLUE}>Team hours overview</SectionLabel>
             {(isAdmin ? ["tanker","jetting","watertank"] : mySupTeams).map((t) => {
               const teamJobs = jobHistory.filter((j)=>j.team===t);
               const { hours: totHrs, ot: totOT } = teamTotals(teamJobs);
@@ -1590,7 +1698,7 @@ export default function AimflowMasterApp() {
     const isAdmin = session.role === "admin";
     return (
       <Shell>
-        <Header title="Admin tools" onBack={()=>setScreen("landing")} accent={PURPLE} />
+        <Header title="Admin tools" onBack={()=>goBack("landing")} accent={PURPLE} />
         <button onClick={()=>setScreen("adminUsers")} style={tileStyle()}>
           <span style={{ ...tileIconStyle, background:PURPLE_LIGHT }}><Users size={22} color={PURPLE} /></span>
           <span style={{ flex:1 }}><span style={tileTitleStyle}>Manage users & PINs</span><span style={tileSubStyle}>{isAdmin ? "Add users, reset PINs, revoke access" : "View and edit worker PINs"}</span></span>
@@ -1628,7 +1736,7 @@ export default function AimflowMasterApp() {
     const supervisors = userDirectory.filter((u)=>u.role==="supervisor");
     return (
       <Shell>
-        <Header title="Supervisor team assignments" onBack={()=>setScreen("adminTools")} accent={BLUE} />
+        <Header title="Supervisor team assignments" onBack={()=>goBack("adminTools")} accent={BLUE} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:16 }}>Assign which teams each supervisor monitors. Supervisors can also self-select from their dashboard.</div>
         {supervisors.map((sup) => {
           const assigned = getSupTeams(sup.name);
@@ -1693,7 +1801,7 @@ export default function AimflowMasterApp() {
 
     return (
       <Shell>
-        <Header title="Archive & reset" onBack={()=>setScreen("adminTools")} accent={GREEN_DARK} />
+        <Header title="Archive & reset" onBack={()=>goBack("adminTools")} accent={GREEN_DARK} />
 
         {showArchiveConfirm && (
           <ConfirmModal
@@ -1821,7 +1929,7 @@ export default function AimflowMasterApp() {
     const isDupe = newResetPw.trim() === resetPassword;
     return (
       <Shell>
-        <Header title="Reset password" onBack={()=>setScreen("adminTools")} accent={AMBER} />
+        <Header title="Reset password" onBack={()=>goBack("adminTools")} accent={AMBER} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:16 }}>This password is required to archive and reset monthly data. Keep it secure and share only with authorised admins.</div>
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Current password</div>
         <div style={{ border:`1px solid ${BORDER}`, borderRadius:12, padding:"13px 14px", marginBottom:16, background:CANVAS, fontSize:14, fontWeight:700, color:INK, letterSpacing:2 }}>{"•".repeat(resetPassword.length)}</div>
@@ -1840,7 +1948,7 @@ export default function AimflowMasterApp() {
     if (myActiveJob) {
       return (
         <Shell>
-          <Header title="Job check-in / check-out" onBack={()=>setScreen("landing")} />
+          <Header title="Job check-in / check-out" onBack={()=>goBack("landing")} />
           <div style={{ border:`1.5px solid ${RED}`, background:RED_LIGHT, borderRadius:16, padding:20, textAlign:"center", marginBottom:16 }}>
             <AlertTriangle size={32} color={RED} style={{ marginBottom:10 }} />
             <div style={{ fontSize:15, fontWeight:700, color:RED, marginBottom:6 }}>Check-out required first</div>
@@ -1855,7 +1963,7 @@ export default function AimflowMasterApp() {
     const canPickAnyTeam = isAdminOrSup;
     return (
       <Shell>
-        <Header title="Job check-in / check-out" onBack={()=>setScreen("landing")} />
+        <Header title="Job check-in / check-out" onBack={()=>goBack("landing")} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:10, fontWeight:600 }}>Which job are you doing right now?</div>
         {["tanker","jetting","watertank"].map((t) => {
           const allowed = canPickAnyTeam || t===session.team;
@@ -1880,7 +1988,7 @@ export default function AimflowMasterApp() {
   if (screen === "checkinGps") {
     return (
       <Shell>
-        <Header title="Check in" onBack={()=>setScreen("checkinoutTeam")} accent={teamAccent(draft.team)} />
+        <Header title="Check in" onBack={()=>goBack("checkinoutTeam")} accent={teamAccent(draft.team)} />
         <ProgressDots step={0} total={3} accent={teamAccent(draft.team)} />
         {isBeta ? (
           <div style={{ padding:"12px 0" }}>
@@ -1969,7 +2077,7 @@ export default function AimflowMasterApp() {
     const allCrewAssigned = draft.vehicles.length>0 && draft.vehicles.every(vehicleReady);
     return (
       <Shell>
-        <Header title="Vehicle on site" onBack={()=>setScreen("checkinGps")} accent={accent} />
+        <Header title="Vehicle on site" onBack={()=>goBack("checkinGps")} accent={accent} />
         <ProgressDots step={1} total={3} accent={accent} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>Select vehicle(s). Use "Others" for another team's vehicle and enter the plate.</div>
         <div style={{ display:"flex", flexDirection:"column", gap:8, marginBottom:18 }}>
@@ -2050,7 +2158,7 @@ export default function AimflowMasterApp() {
     const isDup = draft.jobSite ? checkDuplicate(draft.team, draft.jobSite) : false;
     return (
       <Shell>
-        <Header title="Job site" onBack={()=>setScreen("checkinVehicle")} accent={accent} />
+        <Header title="Job site" onBack={()=>goBack("checkinVehicle")} accent={accent} />
         <ProgressDots step={2} total={3} accent={accent} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>Where are you right now?</div>
         <input autoFocus placeholder="e.g. Changi Airport T1, Grease Trap B2" value={draft.jobSite||""} onChange={(e)=>setDraft({...draft,jobSite:e.target.value})} style={inputStyle} />
@@ -2105,7 +2213,7 @@ export default function AimflowMasterApp() {
     const isLong = hoursNow > 12;
     return (
       <Shell>
-        <Header title="Check out" onBack={()=>setScreen("landing")} accent={teamAccent(myActiveJob.team)} />
+        <Header title="Check out" onBack={()=>goBack("landing")} accent={teamAccent(myActiveJob.team)} />
         <div style={{ border:`1px solid ${BORDER}`, borderRadius:16, padding:18, marginBottom:16, background:"white" }}>
           <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.4 }}>Active job</div>
           <div style={{ fontSize:15, fontWeight:700, color:INK, marginBottom:4 }}>{myActiveJob.jobSite}</div>
@@ -2147,7 +2255,7 @@ export default function AimflowMasterApp() {
     });
     return (
       <Shell>
-        <Header title="Servicing details" onBack={()=>setScreen("checkoutGreet")} accent={accent} />
+        <Header title="Servicing details" onBack={()=>goBack("checkoutGreet")} accent={accent} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:10, fontWeight:600 }}>What did you do on site?</div>
         {lines.map((line,i)=>(
           <div key={i} style={{ border:`1px solid ${BORDER}`, borderRadius:12, padding:13, marginBottom:10, background:"white" }}>
@@ -2205,7 +2313,7 @@ export default function AimflowMasterApp() {
     const serviceSummary = checkoutDraft.serviceLines.map((l)=>`${l.type}${l.qty?` ×${l.qty}`:""}${l.freq?` (${l.freq})`:""}${l.detail?` — ${l.detail}`:""}`).join("; ");
     return (
       <Shell>
-        <Header title="Review check-out" onBack={()=>setScreen("checkoutDetails")} accent={accent} />
+        <Header title="Review check-out" onBack={()=>goBack("checkoutDetails")} accent={accent} />
         {isLong && <div style={{ display:"flex", gap:8, background:AMBER_LIGHT, borderRadius:12, padding:"12px 14px", marginBottom:14, fontSize:12, color:AMBER_DARK }}><AlertTriangle size={16} style={{ flexShrink:0 }} /><span>⚠️ This job exceeded 12 hours ({hours} hrs). Supervisor and admin will be flagged.</span></div>}
         <ReviewBlock rows={[
           ["Site", myActiveJob.jobSite],
@@ -2284,7 +2392,7 @@ export default function AimflowMasterApp() {
   if (screen === "filedTeam") {
     return (
       <Shell>
-        <Header title="File a missed check-in" onBack={()=>setScreen("landing")} accent="#C2570C" />
+        <Header title="File a missed check-in" onBack={()=>goBack("landing")} accent="#C2570C" />
         <div style={{ fontSize:12, color:SLATE, marginBottom:10, fontWeight:600 }}>Which job was this for?</div>
         {["tanker","jetting","watertank"].map((t)=>{
           const allowed = isAdminOrSup || t===session.team;
@@ -2299,7 +2407,7 @@ export default function AimflowMasterApp() {
     const valid = filedDraft.manualCheckIn && filedDraft.manualCheckOut && new Date(filedDraft.manualCheckOut)>new Date(filedDraft.manualCheckIn);
     return (
       <Shell>
-        <Header title="Date & time" onBack={()=>setScreen("filedTeam")} accent="#C2570C" />
+        <Header title="Date & time" onBack={()=>goBack("filedTeam")} accent="#C2570C" />
         <div style={{ display:"flex", gap:8, background:"#FEF0E6", borderRadius:11, padding:"11px 13px", marginBottom:18, fontSize:12, color:"#7C3D08", lineHeight:1.5 }}>
           <FileClock size={16} style={{ flexShrink:0, marginTop:1 }} />
           <span>No GPS for filed entries — enter the actual date and time you were on site. This will be reviewed before it counts toward your hours.</span>
@@ -2326,7 +2434,7 @@ export default function AimflowMasterApp() {
     const allCrewAssigned=filedDraft.vehicles.length>0&&filedDraft.vehicles.every(vehicleReady);
     return (
       <Shell>
-        <Header title="Vehicle on site" onBack={()=>setScreen("filedTimes")} accent={accent} />
+        <Header title="Vehicle on site" onBack={()=>goBack("filedTimes")} accent={accent} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>Select vehicle(s)</div>
         <div style={{ display:"flex", flexDirection:"column", gap:8, marginBottom:18 }}>
           {teamVehicles(filedDraft.team).map((v)=>{
@@ -2393,7 +2501,7 @@ export default function AimflowMasterApp() {
   if (screen === "filedSite" && filedDraft) {
     return (
       <Shell>
-        <Header title="Job site" onBack={()=>setScreen("filedVehicle")} accent="#C2570C" />
+        <Header title="Job site" onBack={()=>goBack("filedVehicle")} accent="#C2570C" />
         <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>Where was this job?</div>
         <input autoFocus placeholder="e.g. Changi Airport T1, Grease Trap B2" value={filedDraft.jobSite} onChange={(e)=>setFiledDraft({...filedDraft,jobSite:e.target.value})} style={{ ...inputStyle, marginBottom:18 }} />
         <PrimaryButton accent="#C2570C" disabled={!filedDraft.jobSite.trim()} onClick={()=>setScreen("filedService")}>Continue</PrimaryButton>
@@ -2419,7 +2527,7 @@ export default function AimflowMasterApp() {
     });
     return (
       <Shell>
-        <Header title="Servicing details" onBack={()=>setScreen("filedSite")} accent={accent} />
+        <Header title="Servicing details" onBack={()=>goBack("filedSite")} accent={accent} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:10, fontWeight:600 }}>What did you do on site?</div>
         {lines.map((line,i)=>(
           <div key={i} style={{ border:`1px solid ${BORDER}`, borderRadius:12, padding:13, marginBottom:10, background:"white" }}>
@@ -2467,7 +2575,7 @@ export default function AimflowMasterApp() {
     const isJetting = filedDraft.team==="jetting";
     return (
       <Shell>
-        <Header title="Job details" onBack={()=>setScreen("filedService")} accent="#C2570C" />
+        <Header title="Job details" onBack={()=>goBack("filedService")} accent="#C2570C" />
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Jobsheet number</div>
         <input value={filedDraft.jobsheet||""} onChange={(e)=>setFiledDraft({...filedDraft,jobsheet:e.target.value})} placeholder="e.g. JS-20240915-001" style={inputStyle} />
         {!isJetting&&<><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>PUB disposal number</div><input value={filedDraft.pubDisposal||""} onChange={(e)=>setFiledDraft({...filedDraft,pubDisposal:e.target.value})} placeholder="e.g. PD-2024-0087" style={inputStyle} /></>}
@@ -2496,7 +2604,7 @@ export default function AimflowMasterApp() {
     const noOneSelected = allCrew.length === 0;
     return (
       <Shell>
-        <Header title="Review filed entry" onBack={()=>setScreen("filedJobsheet")} accent="#C2570C" />
+        <Header title="Review filed entry" onBack={()=>goBack("filedJobsheet")} accent="#C2570C" />
         <div style={{ display:"flex", gap:8, background:"#FEF0E6", borderRadius:12, padding:"12px 14px", marginBottom:16, fontSize:12, color:"#7C3D08" }}>
           <FileClock size={16} style={{ flexShrink:0, marginTop:1 }} />
           <span>Once submitted, a supervisor will review this entry before it counts toward the hours of everyone selected under vehicles/crew.</span>
@@ -2580,7 +2688,7 @@ export default function AimflowMasterApp() {
     };
     return (
       <Shell>
-        <Header title="Review filed entries" onBack={()=>setScreen("landing")} accent="#C2570C" />
+        <Header title="Review filed entries" onBack={()=>goBack("landing")} accent="#C2570C" />
         <FiledTabs entries={scoped} active={filedTab} onChange={setFiledTab} />
         {list.length===0 && <div style={{ textAlign:"center", color:SLATE_LIGHT, fontSize:13, padding:"30px 0" }}>Nothing here yet</div>}
         {list.map((e)=><FiledStatusCard key={e.id} entry={e} isReviewer onApprove={handleApprove} onReject={handleReject} onUndo={handleUndo} />)}
@@ -2591,7 +2699,7 @@ export default function AimflowMasterApp() {
   if (screen === "reviewReject" && reviewTarget) {
     return (
       <Shell>
-        <Header title="Reject filed entry" onBack={()=>setScreen("reviewQueue")} accent={RED} />
+        <Header title="Reject filed entry" onBack={()=>goBack("reviewQueue")} accent={RED} />
         <div style={{ border:`1px solid ${BORDER}`, borderRadius:13, padding:14, marginBottom:16, background:"white" }}>
           <div style={{ fontSize:14, fontWeight:700, color:INK, marginBottom:2 }}>{reviewTarget.jobSite}</div>
           <div style={{ fontSize:12, color:SLATE }}>Filed by {reviewTarget.checker} · {teamLabel(reviewTarget.team)}</div>
@@ -2618,7 +2726,7 @@ export default function AimflowMasterApp() {
     };
     return (
       <Shell>
-        <Header title="My filed entries" onBack={()=>setScreen("myJobLog")} accent="#C2570C" />
+        <Header title="My filed entries" onBack={()=>goBack("myJobLog")} accent="#C2570C" />
         <FiledTabs entries={mine} active={filedTab} onChange={setFiledTab} />
         {list.length===0 && <div style={{ textAlign:"center", color:SLATE_LIGHT, fontSize:13, padding:"30px 0" }}>Nothing here yet</div>}
         {list.map((e)=><FiledStatusCard key={e.id} entry={e} isReviewer={false} onWithdraw={handleWithdraw} onAmend={handleAmend} />)}
@@ -2630,7 +2738,7 @@ export default function AimflowMasterApp() {
   if (screen === "fuelTeam") {
     return (
       <Shell>
-        <Header title="Fuel fill-up" onBack={()=>setScreen("landing")} accent={AMBER} />
+        <Header title="Fuel fill-up" onBack={()=>goBack("landing")} accent={AMBER} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:10, fontWeight:600 }}>Which team's vehicle?</div>
         {["tanker","jetting","watertank"].map((t)=>{
           const allowed=isAdminOrSup||t===session.team;
@@ -2645,7 +2753,7 @@ export default function AimflowMasterApp() {
     const vehicles = teamVehicles(fuelDraft.team).filter((v)=>v!=="Others");
     return (
       <Shell>
-        <Header title="Select vehicle" onBack={()=>setScreen("fuelTeam")} accent={AMBER} />
+        <Header title="Select vehicle" onBack={()=>goBack("fuelTeam")} accent={AMBER} />
         {vehicles.map((v)=>(
           <button key={v} onClick={()=>{setFuelDraft({...fuelDraft,vehicle:v});setScreen("fuelDetails");}} style={{ ...tileStyle(), padding:16 }}>
             <span style={{ width:40, height:40, borderRadius:11, background:AMBER_LIGHT, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}><Fuel size={18} color={AMBER} /></span>
@@ -2664,7 +2772,7 @@ export default function AimflowMasterApp() {
     const valid = effectiveCompany && fuelDraft.amount && fuelDraft.price && fuelDraft.mileage;
     return (
       <Shell>
-        <Header title="Fill-up details" onBack={()=>setScreen("fuelVehicle")} accent={AMBER} />
+        <Header title="Fill-up details" onBack={()=>goBack("fuelVehicle")} accent={AMBER} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>Fuel station</div>
         <div style={{ display:"flex", flexDirection:"column", gap:7, marginBottom: fuelDraft.company === "Others" ? 8 : 14 }}>
           {FUEL_COMPANIES.map((c)=>{
@@ -2778,7 +2886,7 @@ export default function AimflowMasterApp() {
     const totals = personTotals(currentJobHistory, session.name);
     return (
       <Shell>
-        <Header title="My logs" onBack={()=>setScreen("landing")} />
+        <Header title="My logs" onBack={()=>goBack("landing")} />
         <div style={{ display:"flex", gap:10, marginBottom:14 }}>
           <div style={{ flex:1, background:"white", border:`1px solid ${BORDER}`, borderRadius:13, padding:"13px 14px" }}>
             <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:4 }}><Clock size={12} color={BLUE} /><span style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3 }}>TOTAL HOURS</span></div>
@@ -2834,7 +2942,7 @@ export default function AimflowMasterApp() {
   if (screen === "logsHome") {
     return (
       <Shell>
-        <Header title="Team logs" onBack={()=>setScreen("landing")} />
+        <Header title="Team logs" onBack={()=>goBack("landing")} />
         <button onClick={()=>{setLogTeamFilter(null);setScreen("jobLogTeam");}} style={tileStyle()}>
           <span style={{ ...tileIconStyle, background:BLUE_LIGHT }}><ClipboardList size={20} color={BLUE} /></span>
           <span><span style={tileTitleStyle}>Job history</span><span style={tileSubStyle}>Browse by team</span></span>
@@ -2854,7 +2962,7 @@ export default function AimflowMasterApp() {
   if (screen === "jobLogTeam") {
     return (
       <Shell>
-        <Header title="Job history" onBack={()=>setScreen("logsHome")} />
+        <Header title="Job history" onBack={()=>goBack("logsHome")} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:10, fontWeight:600 }}>Which team's jobs?</div>
         {["tanker","jetting","watertank"].map((t)=>{
           const allowed=isAdminOrSup||t===session.team;
@@ -2886,7 +2994,10 @@ export default function AimflowMasterApp() {
     const sortOptions=[{key:"date_desc",label:"Newest"},{key:"date_asc",label:"Oldest"},{key:"name_asc",label:"Checker A–Z"},{key:"site_asc",label:"Site A–Z"}];
     return (
       <Shell>
-        <Header title={`${teamLabel(logTeamFilter)} jobs`} onBack={()=>setScreen("jobLogTeam")} accent={accent} />
+        <Header title={`${teamLabel(logTeamFilter)} jobs`} onBack={()=>goBack("jobLogTeam")} accent={accent} />
+        <button onClick={()=>{setLogPersonName(null);setScreen("personnelLog");}} style={{ display:"flex", alignItems:"center", gap:6, background:"none", border:"none", color:accent, fontSize:12.5, fontWeight:600, cursor:"pointer", padding:0, marginBottom:14 }}>
+          <Users size={13} /> Look up one teammate instead
+        </button>
         <div style={{ display:"flex", gap:10, marginBottom:14 }}>
           <div style={{ flex:1, background:"white", border:`1px solid ${BORDER}`, borderRadius:13, padding:"12px 14px" }}>
             <div style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3, marginBottom:4 }}>TOTAL HRS</div>
@@ -2925,21 +3036,22 @@ export default function AimflowMasterApp() {
                 {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
                 {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
                 {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+                {" · "}<strong>{j.hours} hrs</strong>
+                {ot>0 && isAdminOrSup && <> · <span style={{ color:premium?RED:GREEN_DARK, fontWeight:700 }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span></>}
               </div>
               {j.vehicles?.length>0 && <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:8 }}>{j.vehicles.map((v)=><span key={v} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}><Truck size={11} color="#6B7280" />{v}</span>)}</div>}
-              <div style={{ fontSize:10.5, fontWeight:700, color:SLATE, marginBottom:6, textTransform:"uppercase", letterSpacing:0.3 }}>Hours per person</div>
-              {allPeople.map((person)=>{
-                const otVisible=canSeeOT(session,person);
-                return (
-                  <div key={person} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"5px 0", borderTop:`1px solid ${CANVAS}` }}>
-                    <span style={{ fontSize:12.5, color:INK }}>{person}</span>
-                    <div style={{ display:"flex", gap:6 }}>
-                      <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{j.hours} hrs</span>
-                      {otVisible ? (ot>0&&<span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:premium?RED_LIGHT:GREEN_LIGHT, color:premium?RED:GREEN_DARK }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span>) : <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:SLATE_LIGHT, display:"flex", alignItems:"center", gap:4 }}><Lock size={10} /> OT hidden</span>}
-                    </div>
-                  </div>
-                );
-              })}
+              <div style={{ fontSize:10.5, fontWeight:700, color:SLATE, marginBottom:6, textTransform:"uppercase", letterSpacing:0.3 }}>Personnel</div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                {allPeople.map((person)=>{
+                  const otVisible=canSeeOT(session,person);
+                  return (
+                    <span key={person} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11.5, fontWeight:600, padding:"4px 9px", borderRadius:7, background:CANVAS, color:INK }}>
+                      {person}
+                      {otVisible ? (ot>0 && <span style={{ color:premium?RED:GREEN_DARK, fontWeight:700 }}>· {ot.toFixed(1)} OT</span>) : <Lock size={9} color={SLATE_LIGHT} />}
+                    </span>
+                  );
+                })}
+              </div>
               <JobDetailDropdown job={j} />
               {isAdminOrSup && session.role!=="beta" && (
                 <div style={{ display:"flex", gap:8, marginTop:10 }}>
@@ -2970,7 +3082,7 @@ export default function AimflowMasterApp() {
     const relevantTeams = canPickAnyone ? ["tanker","jetting","watertank"] : [myOwnTeam].filter(Boolean);
     return (
       <Shell>
-        <Header title="Personnel log" onBack={()=>setScreen(isWorker?"landing":"logsHome")} accent={PURPLE} />
+        <Header title="Personnel log" onBack={()=>goBack(isWorker?"landing":"logsHome")} accent={PURPLE} />
 
         {/* Team totals — aggregate only, no per-person OT exposure */}
         <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Team totals</div>
@@ -3037,7 +3149,7 @@ export default function AimflowMasterApp() {
   if (screen === "fuelLogTeam") {
     return (
       <Shell>
-        <Header title="Fuel fill-up history" onBack={()=>setScreen("logsHome")} accent={AMBER} />
+        <Header title="Fuel fill-up history" onBack={()=>goBack("logsHome")} accent={AMBER} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:10, fontWeight:600 }}>Which team's vehicles?</div>
         {["tanker","jetting","watertank"].map((t)=>{
           const allowed=isAdminOrSup||t===session.team;
@@ -3062,7 +3174,7 @@ export default function AimflowMasterApp() {
     const vehiclesInTeam = teamVehicles(logTeamFilter).filter((v)=>v!=="Others");
     return (
       <Shell>
-        <Header title={`${teamLabel(logTeamFilter)} vehicles`} onBack={()=>setScreen("fuelLogTeam")} accent={AMBER} />
+        <Header title={`${teamLabel(logTeamFilter)} vehicles`} onBack={()=>goBack("fuelLogTeam")} accent={AMBER} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:10, fontWeight:600 }}>Select a vehicle to see its fill-up history</div>
         {vehiclesInTeam.map((v)=>(
           <button key={v} onClick={()=>{setLogVehicleName(v);setScreen("fuelLogView");}} style={{ ...tileStyle(), padding:16 }}>
@@ -3090,7 +3202,7 @@ export default function AimflowMasterApp() {
     const totals=myFillUps.reduce((acc,f)=>{ acc.litres+=parseFloat(f.amount||0); acc.spend+=parseFloat(f.price||0); return acc; },{litres:0,spend:0});
     return (
       <Shell>
-        <Header title={logVehicleName} onBack={()=>setScreen("fuelLogVehicle")} accent={AMBER} />
+        <Header title={logVehicleName} onBack={()=>goBack("fuelLogVehicle")} accent={AMBER} />
         <div style={{ display:"flex", gap:10, marginBottom:18 }}>
           <div style={{ flex:1, background:AMBER_LIGHT, borderRadius:13, padding:"12px 14px" }}><div style={{ fontSize:11, color:AMBER_DARK, fontWeight:600, marginBottom:4 }}>Total litres</div><div style={{ fontSize:19, fontWeight:800, color:AMBER_DARK }}>{totals.litres.toFixed(1)}</div></div>
           <div style={{ flex:1, background:"#F1EFE8", borderRadius:13, padding:"12px 14px" }}><div style={{ fontSize:11, color:"#5F5E5A", fontWeight:600, marginBottom:4 }}>Total spend</div><div style={{ fontSize:19, fontWeight:800, color:"#2C2C2A" }}>S${totals.spend.toFixed(0)}</div></div>
@@ -3146,7 +3258,7 @@ export default function AimflowMasterApp() {
     const toggleVehicle=(v)=>setEditDraft({...editDraft,vehicles:editDraft.vehicles.includes(v)?editDraft.vehicles.filter((x)=>x!==v):[...editDraft.vehicles,v]});
     return (
       <Shell>
-        <Header title="Edit job entry" onBack={()=>{setEditTarget(null);setEditDraft(null);setScreen("jobLogView");}} accent={accent} />
+        <Header title="Edit job entry" onBack={()=>{setEditTarget(null);setEditDraft(null);goBack("jobLogView");}} accent={accent} />
         <div style={{ display:"flex", gap:8, background:BLUE_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:18, fontSize:12, color:BLUE_DARK }}><Pencil size={15} style={{ flexShrink:0, marginTop:1 }} /><span>Editing as {session.name}. Changes to times will immediately recalculate hours and OT.</span></div>
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Job site</div>
         <input value={editDraft.jobSite} onChange={(e)=>setEditDraft({...editDraft,jobSite:e.target.value})} style={inputStyle} />
@@ -3199,7 +3311,7 @@ export default function AimflowMasterApp() {
     };
     return (
       <Shell>
-        <Header title="Confirm deletion" onBack={()=>{setEntryDeleteTarget(null);setScreen("jobLogView");}} accent={RED} />
+        <Header title="Confirm deletion" onBack={()=>{setEntryDeleteTarget(null);goBack("jobLogView");}} accent={RED} />
         <div style={{ border:`2px solid ${RED}`, background:RED_LIGHT, borderRadius:16, padding:20, textAlign:"center", marginBottom:18 }}>
           <AlertTriangle size={36} color={RED} style={{ marginBottom:10 }} />
           <div style={{ fontSize:16, fontWeight:800, color:RED, marginBottom:8 }}>Delete this job entry</div>
@@ -3212,7 +3324,7 @@ export default function AimflowMasterApp() {
         <input value={entryDeleteCode} onChange={(e)=>{setEntryDeleteCode(e.target.value.toUpperCase());setEntryDeleteError(null);}} placeholder="Confirmation code" style={{ ...inputStyle, textAlign:"center", letterSpacing:2, fontWeight:700, fontSize:15, border:`1.5px solid ${entryDeleteError?RED:BORDER}` }} />
         {entryDeleteError && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={15} style={{ flexShrink:0, marginTop:1 }} /><span>{entryDeleteError}</span></div>}
         <button onClick={handleConfirm} disabled={!entryDeleteCode.trim()} style={{ width:"100%", padding:15, borderRadius:12, border:"none", background:!entryDeleteCode.trim()?"#F0F1F4":RED, color:!entryDeleteCode.trim()?"#B0B4BC":"white", fontSize:15, fontWeight:800, cursor:!entryDeleteCode.trim()?"not-allowed":"pointer", marginBottom:10 }}>Permanently delete</button>
-        <button onClick={()=>{setEntryDeleteTarget(null);setScreen("jobLogView");}} style={{ width:"100%", padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Cancel</button>
+        <button onClick={()=>{setEntryDeleteTarget(null);goBack("jobLogView");}} style={{ width:"100%", padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Cancel</button>
       </Shell>
     );
   }
@@ -3221,7 +3333,7 @@ export default function AimflowMasterApp() {
   if (screen === "betaDataTools" && isBeta) {
     return (
       <Shell>
-        <Header title="Beta data tools" onBack={()=>setScreen("landing")} accent={PURPLE} />
+        <Header title="Beta data tools" onBack={()=>goBack("landing")} accent={PURPLE} />
         <div style={{ display:"flex", gap:8, background:PURPLE_LIGHT, borderRadius:12, padding:"11px 13px", marginBottom:18, fontSize:12, color:PURPLE }}><ShieldAlert size={16} style={{ flexShrink:0, marginTop:1 }} /><span>This only affects Beta Tester data. Live company records are never touched here.</span></div>
         <div style={{ fontSize:12, color:SLATE, marginBottom:10, fontWeight:600 }}>{betaJobHistory.length} job record{betaJobHistory.length===1?"":"s"} · {betaFuelHistory.length} fuel record{betaFuelHistory.length===1?"":"s"} currently simulated</div>
         <button onClick={()=>{setDeleteTarget("beta");setDeleteCode("");setDeleteError(null);setScreen("deleteConfirm");}} disabled={betaJobHistory.length===0&&betaFuelHistory.length===0} style={{ width:"100%", padding:15, borderRadius:12, border:`1.5px solid ${RED}`, background:"white", color:RED, fontSize:14, fontWeight:700, cursor:(betaJobHistory.length===0&&betaFuelHistory.length===0)?"not-allowed":"pointer", opacity:(betaJobHistory.length===0&&betaFuelHistory.length===0)?0.4:1, display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
@@ -3244,7 +3356,7 @@ export default function AimflowMasterApp() {
     const rowBtnStyle=(empty)=>({ width:"100%", display:"flex", alignItems:"center", justifyContent:"space-between", padding:"13px 15px", borderRadius:11, border:`1px solid ${empty?BORDER:RED}`, background:"white", marginBottom:8, cursor:empty?"not-allowed":"pointer", opacity:empty?0.45:1 });
     return (
       <Shell>
-        <Header title="Data management" onBack={()=>setScreen("adminTools")} accent={RED} />
+        <Header title="Data management" onBack={()=>goBack("adminTools")} accent={RED} />
         <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:12, padding:"11px 13px", marginBottom:18, fontSize:12, color:RED }}><AlertTriangle size={16} style={{ flexShrink:0, marginTop:1 }} /><span>These actions permanently delete live company records and cannot be undone.</span></div>
         <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Select a team</div>
         <select value={dataToolsTeam||""} onChange={(e)=>setDataToolsTeam(e.target.value||null)} style={{ ...inputStyle, marginBottom:dataToolsTeam?18:24, cursor:"pointer" }}>
@@ -3288,7 +3400,7 @@ export default function AimflowMasterApp() {
     };
     return (
       <Shell>
-        <Header title="Confirm deletion" onBack={()=>setScreen(backScreen)} accent={RED} />
+        <Header title="Confirm deletion" onBack={()=>goBack(backScreen)} accent={RED} />
         <div style={{ border:`2px solid ${RED}`, background:RED_LIGHT, borderRadius:16, padding:20, textAlign:"center", marginBottom:18 }}>
           <AlertTriangle size={36} color={RED} style={{ marginBottom:10 }} />
           <div style={{ fontSize:16, fontWeight:800, color:RED, marginBottom:8 }}>{info.title}</div>
@@ -3299,7 +3411,7 @@ export default function AimflowMasterApp() {
         <input value={deleteCode} onChange={(e)=>{setDeleteCode(e.target.value.toUpperCase());setDeleteError(null);}} placeholder="Confirmation code" style={{ ...inputStyle, textAlign:"center", letterSpacing:2, fontWeight:700, fontSize:15, border:`1.5px solid ${deleteError?RED:BORDER}` }} />
         {deleteError && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={15} style={{ flexShrink:0, marginTop:1 }} /><span>{deleteError}</span></div>}
         <button onClick={handleConfirm} disabled={!deleteCode.trim()} style={{ width:"100%", padding:15, borderRadius:12, border:"none", background:!deleteCode.trim()?"#F0F1F4":RED, color:!deleteCode.trim()?"#B0B4BC":"white", fontSize:15, fontWeight:800, cursor:!deleteCode.trim()?"not-allowed":"pointer", marginBottom:10 }}>Permanently delete</button>
-        <button onClick={()=>setScreen(backScreen)} style={{ width:"100%", padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Cancel</button>
+        <button onClick={()=>goBack(backScreen)} style={{ width:"100%", padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Cancel</button>
       </Shell>
     );
   }
@@ -3323,7 +3435,7 @@ export default function AimflowMasterApp() {
     };
     return (
       <Shell>
-        <Header title="Manage users & PINs" onBack={()=>setScreen("adminTools")} accent={PURPLE} />
+        <Header title="Manage users & PINs" onBack={()=>goBack("adminTools")} accent={PURPLE} />
         <PrimaryButton accent={PURPLE} onClick={()=>{ setNewUserDraft({ name:"", role:"worker", team:"tanker", pin:"" }); setScreen("adminAddUser"); }}>
           <UserPlus size={16} /> Add new user
         </PrimaryButton>
@@ -3371,7 +3483,7 @@ export default function AimflowMasterApp() {
     };
     return (
       <Shell>
-        <Header title="Add new user" onBack={()=>setScreen("adminUsers")} accent={PURPLE} />
+        <Header title="Add new user" onBack={()=>goBack("adminUsers")} accent={PURPLE} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Full name</div>
         <input autoFocus value={newUserDraft.name} onChange={(e)=>setNewUserDraft({...newUserDraft,name:e.target.value})} placeholder="e.g. Ahmad bin Razak" style={inputStyle} />
         {nameConflict && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={15} style={{ flexShrink:0 }} /><span>A user with this name already exists.</span></div>}
@@ -3464,7 +3576,7 @@ export default function AimflowMasterApp() {
     const canRemove = target?.name !== "Master Admin" && target?.name !== session.name;
     return (
       <Shell>
-        <Header title={`Edit — ${pinEditTarget}`} onBack={()=>setScreen("adminUsers")} accent={PURPLE} />
+        <Header title={`Edit — ${pinEditTarget}`} onBack={()=>goBack("adminUsers")} accent={PURPLE} />
 
         {pinEditConfirmAction === "rename" && (
           <ConfirmModal
@@ -3593,7 +3705,7 @@ export default function AimflowMasterApp() {
 
     return (
       <Shell>
-        <Header title="Manage vehicles" onBack={()=>setScreen("adminTools")} accent={BLUE} />
+        <Header title="Manage vehicles" onBack={()=>goBack("adminTools")} accent={BLUE} />
 
         {vehicleDeleteTarget && (
           <ConfirmModal
@@ -3679,7 +3791,7 @@ export default function AimflowMasterApp() {
     const canEdit=(e)=>session.role==="admin"||session.role==="supervisor"||e.name===session.name;
     return (
       <Shell>
-        <Header title="Team leave board" onBack={()=>setScreen("landing")} accent={GREEN_DARK} />
+        <Header title="Team leave board" onBack={()=>goBack("landing")} accent={GREEN_DARK} />
         {leaveDeleteTarget && (
           <ConfirmModal
             title="Remove this leave entry?"
@@ -3767,7 +3879,7 @@ export default function AimflowMasterApp() {
     const canEdit=(e)=>session.role==="admin"||session.role==="supervisor"||e.name===session.name;
     return (
       <Shell>
-        <Header title={`${teamLabel(leaveBoardTeam)} team — leave`} onBack={()=>setScreen("leaveBoard")} accent={teamAccent(leaveBoardTeam)} />
+        <Header title={`${teamLabel(leaveBoardTeam)} team — leave`} onBack={()=>goBack("leaveBoard")} accent={teamAccent(leaveBoardTeam)} />
         {leaveDeleteTarget && (
           <ConfirmModal
             title="Remove this leave entry?"
@@ -3826,7 +3938,7 @@ export default function AimflowMasterApp() {
     const valid=leaveDraft.type&&leaveDraft.startDate&&leaveDraft.endDate&&leaveDraft.startDate<=leaveDraft.endDate;
     return (
       <Shell>
-        <Header title={isEditing?"Edit leave entry":"Post leave / absence"} onBack={()=>setScreen("leaveBoard")} accent={GREEN_DARK} />
+        <Header title={isEditing?"Edit leave entry":"Post leave / absence"} onBack={()=>goBack("leaveBoard")} accent={GREEN_DARK} />
         {canPostForOthers && !isEditing && (
           <>
             <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Posting for</div>
