@@ -632,7 +632,7 @@ function TeamLastJobCard({ team, jobHistory, filedEntries, onClick }) {
       </div>
       {lastJob ? (
         <div style={{ padding:"10px 14px" }}>
-          <div style={{ fontSize:13, fontWeight:600, color:INK, marginBottom:2 }}>{lastJob.jobSite}</div>
+          <div style={{ fontSize:13, fontWeight:600, color:lastJob.jobSite?INK:SLATE_LIGHT, marginBottom:2, fontStyle:lastJob.jobSite?"normal":"italic" }}>{lastJob.jobSite||"No site recorded"}</div>
           <div style={{ fontSize:11, color:SLATE, marginBottom:8 }}>
             {new Date(lastJob.checkOutTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})}
             {" · "}{new Date(lastJob.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
@@ -2248,7 +2248,7 @@ export default function AimflowMasterApp() {
       const resolvedCrewByVehicle={};
       (entry.vehicles||[]).forEach((v)=>{resolvedCrewByVehicle[v]=entry.crew||[];});
       const newJob={
-        id:`job-${entry.id}`, team:entry.team, checker:entry.checker,
+        id:`job-${entry.id}`, team:entry.team, checker:entry.checker, jobSite:entry.jobSite,
         checkInTime:entry.checkInTime, checkOutTime:entry.checkOutTime, hours:entry.hours,
         vehicles:entry.vehicles, crew:entry.crew, crewByVehicle:resolvedCrewByVehicle,
         serviceLines:entry.serviceLines, jobsheet:entry.jobsheet, pubDisposal:entry.pubDisposal,
@@ -2597,7 +2597,7 @@ export default function AimflowMasterApp() {
                 <span style={{ fontSize:11, fontWeight:700, padding:"3px 9px", borderRadius:7, background:BLUE_LIGHT, color:BLUE }}>Checked in by {j.checker}</span>
                 <span style={{ fontSize:11, color:premium?RED:SLATE_LIGHT, fontWeight:premium?700:400 }}>{dayType}</span>
               </div>
-              <div style={{ fontSize:14.5, fontWeight:700, color:INK, marginBottom:2 }}>{j.jobSite}</div>
+              <div style={{ fontSize:14.5, fontWeight:700, color:j.jobSite?INK:SLATE_LIGHT, marginBottom:2, fontStyle:j.jobSite?"normal":"italic" }}>{j.jobSite||"No site recorded"}</div>
               <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
                 {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
                 {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
