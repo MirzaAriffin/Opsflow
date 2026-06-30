@@ -116,6 +116,40 @@ function getDayType(ts) { const {dateStr,weekday}=sgDateParts(ts),year=dateStr.s
 function isPremiumDay(dt) { return dt==="Sunday"||dt==="Public Holiday"; }
 function roundOT(v) { return Math.round(v*10)/10; }
 function calcOT(cin,cout) { const dt=getDayType(cin),hrs=(cout-cin)/3600000; if(isPremiumDay(dt))return roundOT(hrs); const {dateStr}=sgDateParts(cin),isSat=dt==="Saturday",endH=isSat?12:17,dayEnd=new Date(`${dateStr}T${String(endH).padStart(2,"0")}:30:00+08:00`).getTime(),dayStart=new Date(`${dateStr}T08:30:00+08:00`).getTime(); let ot=0; if(cin<dayStart)ot+=Math.min(cout,dayStart)-cin; if(cout>dayEnd)ot+=cout-Math.max(cin,dayEnd); return roundOT(Math.max(0,ot)/3600000); }
+
+// ── Per-person job credit ─────────────────────────────────────────────
+// Every person on a job (checker + crew) individually earns the job's full hours and OT.
+// "Team total OT" = sum of every individual's OT credit, i.e. headcount × per-job OT.
+function jobCreditedPeople(job) {
+  const people = new Set();
+  if (job.checker) people.add(job.checker);
+  (job.crew || []).forEach((name) => { if (name) people.add(name); });
+  return [...people];
+}
+
+// Sum hours/OT credited to ONE specific person across a list of jobs (their personal total).
+function personTotals(jobs, personName) {
+  return jobs.reduce((acc, j) => {
+    if (jobCreditedPeople(j).includes(personName)) {
+      acc.hours += parseFloat(j.hours || 0);
+      acc.ot += calcOT(j.checkInTime, j.checkOutTime);
+      acc.jobCount += 1;
+    }
+    return acc;
+  }, { hours: 0, ot: 0, jobCount: 0 });
+}
+
+// Sum hours/OT across ALL people on ALL jobs (team/aggregate total — payroll view).
+// Each person on each job counts separately: 2 people on a 1hr-OT job = 2hrs team OT.
+function teamTotals(jobs) {
+  return jobs.reduce((acc, j) => {
+    const headcount = jobCreditedPeople(j).length || 1;
+    acc.hours += parseFloat(j.hours || 0) * headcount;
+    acc.ot += calcOT(j.checkInTime, j.checkOutTime) * headcount;
+    return acc;
+  }, { hours: 0, ot: 0 });
+}
+
 function canSeeOT(session,ownerName) { return session.role==="admin"||session.role==="supervisor"||session.role==="beta"||session.name===ownerName; }
 
 // ── Empty drafts ─────────────────────────────────────────────────────
@@ -404,7 +438,8 @@ function FiledStatusCard({ entry: e, isReviewer, onApprove, onReject, onUndo, on
       <div style={{ padding:"12px 14px" }}>
         <div style={{ fontSize:14.5, fontWeight:700, color:INK, marginBottom:3 }}>{e.jobSite}</div>
         <div style={{ fontSize:12, color:SLATE, marginBottom:6 }}>
-          Filed by <strong>{e.checker}</strong>
+          For <strong>{(e.crew?.length ? e.crew : [e.checker]).join(", ")}</strong>
+          {e.filedBy && e.filedBy !== e.checker && <> · filed by {e.filedBy}</>}
           {e.checkInTime && e.checkOutTime && (
             <> · {new Date(e.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})}
             {" · "}{new Date(e.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})} – {new Date(e.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}</>
@@ -585,10 +620,29 @@ function TeamLastJobCard({ team, jobHistory, filedEntries, onClick }) {
       {lastJob ? (
         <div style={{ padding:"10px 14px" }}>
           <div style={{ fontSize:13, fontWeight:600, color:INK, marginBottom:2 }}>{lastJob.jobSite}</div>
-          <div style={{ fontSize:11, color:SLATE }}>
+          <div style={{ fontSize:11, color:SLATE, marginBottom:8 }}>
             {new Date(lastJob.checkOutTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})}
-            {" · "}{lastJob.checker} · {lastJob.hours} hrs
+            {" · "}{new Date(lastJob.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+            {" – "}{new Date(lastJob.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+            {" · "}{lastJob.hours} hrs
           </div>
+          {lastJob.serviceLines?.length > 0 && (
+            <div style={{ background:`${accent}10`, borderRadius:8, padding:"7px 10px", marginBottom:8, fontSize:11, color:"#374151", lineHeight:1.6 }}>
+              {lastJob.serviceLines.map((l,i) => (
+                <div key={i}>• {l.type}{l.qty ? ` ×${l.qty}` : ""}{l.freq ? ` (${l.freq})` : ""}{l.detail ? ` — ${l.detail}` : ""}</div>
+              ))}
+            </div>
+          )}
+          {lastJob.crew?.length > 0 && (
+            <div style={{ display:"flex", flexWrap:"wrap", gap:5, marginBottom: lastJob.remarks ? 8 : 0 }}>
+              {lastJob.crew.map((name) => (
+                <span key={name} style={{ fontSize:10.5, fontWeight:600, padding:"2px 8px", borderRadius:6, background:"white", color:"#374151", border:`1px solid ${BORDER}` }}>👷 {name}</span>
+              ))}
+            </div>
+          )}
+          {lastJob.remarks && (
+            <div style={{ fontSize:11, color:SLATE, fontStyle:"italic" }}>Remarks: "{lastJob.remarks}"</div>
+          )}
         </div>
       ) : (
         <div style={{ padding:"10px 14px", fontSize:12, color:SLATE_LIGHT }}>No jobs logged yet</div>
@@ -627,6 +681,24 @@ function LogoutModal({ onConfirm, onCancel }) {
         <div style={{ display:"flex", gap:10 }}>
           <button onClick={onCancel} style={{ flex:1, padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:14, fontWeight:600, cursor:"pointer" }}>Cancel</button>
           <button onClick={onConfirm} style={{ flex:1, padding:13, borderRadius:12, border:"none", background:RED, color:"white", fontSize:14, fontWeight:700, cursor:"pointer" }}>Log out</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Generic confirmation modal — used for ANY destructive action (remove user, revoke,
+// reset archive, delete logs, etc). Every deletion/reset in the app must route through this.
+function ConfirmModal({ title, body, confirmLabel = "Confirm", confirmColor = RED, icon: Icon = AlertTriangle, onConfirm, onCancel }) {
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999, padding:20 }}>
+      <div style={{ background:"white", borderRadius:20, padding:24, maxWidth:360, width:"100%", textAlign:"center" }}>
+        <Icon size={32} color={confirmColor} style={{ marginBottom:12 }} />
+        <div style={{ fontSize:16, fontWeight:700, color:INK, marginBottom:8 }}>{title}</div>
+        <div style={{ fontSize:13, color:SLATE, marginBottom:20, lineHeight:1.5 }}>{body}</div>
+        <div style={{ display:"flex", gap:10 }}>
+          <button onClick={onCancel} style={{ flex:1, padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:14, fontWeight:600, cursor:"pointer" }}>Cancel</button>
+          <button onClick={onConfirm} style={{ flex:1, padding:13, borderRadius:12, border:"none", background:confirmColor, color:"white", fontSize:14, fontWeight:700, cursor:"pointer" }}>{confirmLabel}</button>
         </div>
       </div>
     </div>
@@ -738,14 +810,18 @@ export default function AimflowMasterApp() {
   const settingsDoc = useFireDoc(COL.settings, "config", null);
   const resetPassword = settingsDoc?.resetPassword || "RESET2025";
   const supervisorTeamPrefs = settingsDoc?.supervisorTeamPrefs || {};
+  const removedUsers = settingsDoc?.removedUsers || []; // names removed by admin/sup — must stay removed even though they exist in USERS_DEFAULT
 
   const userDirectory = (() => {
-    if (usersLoading || remoteUsers.length === 0) return USERS_DEFAULT;
-    const fsMap = {};
-    remoteUsers.forEach(u => { fsMap[u.name] = u; });
-    const merged = USERS_DEFAULT.map(u => fsMap[u.name] ? { ...u, ...fsMap[u.name] } : u);
-    remoteUsers.forEach(u => { if (!USERS_DEFAULT.find(d => d.name === u.name)) merged.push(u); });
-    return merged;
+    let base = USERS_DEFAULT;
+    if (!usersLoading && remoteUsers.length > 0) {
+      const fsMap = {};
+      remoteUsers.forEach(u => { fsMap[u.name] = u; });
+      const merged = USERS_DEFAULT.map(u => fsMap[u.name] ? { ...u, ...fsMap[u.name] } : u);
+      remoteUsers.forEach(u => { if (!USERS_DEFAULT.find(d => d.name === u.name)) merged.push(u); });
+      base = merged;
+    }
+    return base.filter(u => !removedUsers.includes(u.name));
   })();
 
   // ── Session state ─────────────────────────────────────────────────
@@ -783,6 +859,13 @@ export default function AimflowMasterApp() {
   const [leaveEditTarget, setLeaveEditTarget] = useState(null);
   const [leaveBoardTeam, setLeaveBoardTeam] = useState(null);
   const [archivePassword, setArchivePassword] = useState("");
+  const [archiveRangeMode, setArchiveRangeMode] = useState("all"); // "all" | "custom"
+  const [archiveRangeStart, setArchiveRangeStart] = useState("");
+  const [archiveRangeEnd, setArchiveRangeEnd] = useState("");
+  const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
+  const [restoreConfirmTarget, setRestoreConfirmTarget] = useState(null);
+  const [leaveDeleteTarget, setLeaveDeleteTarget] = useState(null);
+  const [showLeavePostDeleteConfirm, setShowLeavePostDeleteConfirm] = useState(false);
   const [archiveError, setArchiveError] = useState(null);
   const [archiveSuccess, setArchiveSuccess] = useState(null);
   const [newResetPw, setNewResetPw] = useState("");
@@ -790,6 +873,7 @@ export default function AimflowMasterApp() {
   const [longJobWarningDismissed, setLongJobWarningDismissed] = useState(false);
   const [newUserDraft, setNewUserDraft] = useState(null);
   const [editUserTeam, setEditUserTeam] = useState(undefined);
+  const [pinEditConfirmAction, setPinEditConfirmAction] = useState(null); // null | "remove" | "revoke"
   const [syncError, setSyncError] = useState(null);
   const [betaActiveJobs, setBetaActiveJobs] = useState([]);
   const [betaJobHistory, setBetaJobHistory] = useState([]);
@@ -846,7 +930,11 @@ export default function AimflowMasterApp() {
   const deleteLeave = (id) => fsOp(() => fsDelete(COL.leave, id));
   const updateUser = (name, data) => fsOp(() => fsSet(COL.users, name, data));
   const addUser = (user) => fsOp(() => fsSet(COL.users, user.name, user));
-  const removeUser = (name) => fsOp(() => fsDelete(COL.users, name));
+  const removeUser = (name) => fsOp(async () => {
+    await fsDelete(COL.users, name); // remove Firestore doc if it exists (covers added-not-seeded users)
+    const next = [...new Set([...removedUsers, name])];
+    await fsSet(COL.settings, "config", { ...(settingsDoc||{}), removedUsers: next });
+  });
   const updateSettings = (data) => fsOp(() => fsSet(COL.settings, "config", { ...(settingsDoc||{}), ...data }));
   const setSupervisorTeamPrefs = (prefs) => updateSettings({ supervisorTeamPrefs: prefs });
 
@@ -876,13 +964,35 @@ export default function AimflowMasterApp() {
   function exportPDF(jobs,fuel){const win=window.open("","_blank");const today=new Date().toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"});const jobRows=jobs.map(j=>`<tr><td>${j.checkInTime?new Date(j.checkInTime).toLocaleDateString("en-SG"):""}</td><td>${teamLabel(j.team)}</td><td>${j.jobSite}</td><td>${j.checker}</td><td>${(j.crew||[]).join(", ")}</td><td>${(j.serviceLines||[]).map(l=>`${l.type}${l.qty?` x${l.qty}`:""}`).join("; ")}</td><td>${j.hours}</td><td>${calcOT(j.checkInTime,j.checkOutTime).toFixed(1)}</td><td>${j.jobsheet||""}</td></tr>`).join("");const fuelRows=fuel.map(f=>`<tr><td>${f.date?new Date(f.date).toLocaleDateString("en-SG"):""}</td><td>${teamLabel(f.team)}</td><td>${f.person}</td><td>${f.vehicle}</td><td>${f.company}</td><td>${f.amount}L</td><td>S$${f.price}</td><td>${f.amount&&f.price?(parseFloat(f.price)/parseFloat(f.amount)).toFixed(3):""}</td></tr>`).join("");win.document.write(`<!DOCTYPE html><html><head><title>Opsflow Export ${today}</title><style>body{font-family:Arial,sans-serif;font-size:10px;padding:16px}h1{font-size:14px}h2{font-size:12px;margin-top:20px}table{width:100%;border-collapse:collapse;margin-top:6px}th,td{border:1px solid #ddd;padding:4px 6px;text-align:left}th{background:#f0f4ff}tr:nth-child(even){background:#fafafa}</style></head><body><h1>Opsflow — Aimflow Pte Ltd</h1><p>Exported: ${today}</p><h2>Jobs (${jobs.length})</h2><table><tr><th>Date</th><th>Team</th><th>Site</th><th>Checker</th><th>Crew</th><th>Services</th><th>Hrs</th><th>OT</th><th>Jobsheet</th></tr>${jobRows}</table><h2>Fuel (${fuel.length})</h2><table><tr><th>Date</th><th>Team</th><th>Person</th><th>Vehicle</th><th>Station</th><th>Amount</th><th>Price</th><th>$/L</th></tr>${fuelRows}</table></body></html>`);win.document.close();win.print();}
 
   // ── Archive / reset ───────────────────────────────────────────────
-  async function doArchiveReset(pw) {
+  // rangeStart/rangeEnd are "YYYY-MM-DD" strings (inclusive). If omitted, defaults to everything.
+  async function doArchiveReset(pw, rangeStart, rangeEnd, label) {
     if (pw!==resetPassword){setArchiveError("Incorrect reset password.");return false;}
-    const month=new Date().toLocaleDateString("en-SG",{month:"short",year:"numeric"});
-    const snapshot={id:`archive-${Date.now()}`,label:month,archivedAt:Date.now(),archivedBy:session.name,jobs:[...jobHistory],fuel:[...fuelHistory],filed:[...filedEntries]};
+    const startTs = rangeStart ? new Date(`${rangeStart}T00:00:00+08:00`).getTime() : -Infinity;
+    const endTs = rangeEnd ? new Date(`${rangeEnd}T23:59:59+08:00`).getTime() : Infinity;
+    const inRange = (ts) => ts >= startTs && ts <= endTs;
+
+    const jobsInRange = jobHistory.filter(j => inRange(j.checkInTime));
+    const fuelInRange = fuelHistory.filter(f => inRange(f.date));
+    const filedInRange = filedEntries.filter(e => inRange(e.checkInTime || e.filedAt));
+
+    if (jobsInRange.length === 0 && fuelInRange.length === 0 && filedInRange.length === 0) {
+      setArchiveError("No records found in that date range.");
+      return false;
+    }
+
+    const finalLabel = label || (rangeStart && rangeEnd
+      ? `${new Date(`${rangeStart}T12:00:00+08:00`).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})} – ${new Date(`${rangeEnd}T12:00:00+08:00`).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})}`
+      : new Date().toLocaleDateString("en-SG",{month:"short",year:"numeric"}));
+
+    const snapshot={ id:`archive-${Date.now()}`, label:finalLabel, archivedAt:Date.now(), archivedBy:session.name, rangeStart:rangeStart||null, rangeEnd:rangeEnd||null, jobs:jobsInRange, fuel:fuelInRange, filed:filedInRange };
     await fsOp(()=>fsSet(COL.archives,snapshot.id,snapshot));
-    await executeDeletion("all_live");
-    setArchiveError(null);setArchiveSuccess(`Data for ${month} archived and reset.`);
+    // Only delete the records that were actually archived — anything outside the range stays live.
+    await fsOp(async () => {
+      for (const j of jobsInRange) await fsDelete(COL.jobs, j.id);
+      for (const f of fuelInRange) await fsDelete(COL.fuel, f.id);
+      for (const e of filedInRange) await fsDelete(COL.filed, e.id);
+    });
+    setArchiveError(null);setArchiveSuccess(`${finalLabel}: ${jobsInRange.length} jobs, ${fuelInRange.length} fuel records, ${filedInRange.length} filed entries archived and reset.`);
     return true;
   }
   function restoreArchive(arc) {
@@ -900,7 +1010,7 @@ export default function AimflowMasterApp() {
   const isTeamLead=session&&(session.role==="admin"||session.role==="supervisor");
   const jobHoursNow=myActiveJob?(Date.now()-myActiveJob.checkInTime)/3600000:0;
   const isLongJob=jobHoursNow>12;
-  const myCumulative=session?currentJobHistory.filter(j=>j.checker===session.name||(j.crew||[]).includes(session.name)).reduce((acc,j)=>({hours:acc.hours+parseFloat(j.hours||0),ot:acc.ot+calcOT(j.checkInTime,j.checkOutTime)}),{hours:0,ot:0}):{hours:0,ot:0};
+  const myCumulative=session?personTotals(currentJobHistory,session.name):{hours:0,ot:0,jobCount:0};
   const pendingCount=filedEntries.filter(e=>e.status==="pending").length;
   const todayOut=leaveEntries.filter(e=>isLeaveActiveToday(e));
   const soon=leaveEntries.filter(e=>{if(isLeaveActiveToday(e))return false;const today=sgToday(),cutoff=new Date(`${today}T00:00:00+08:00`).getTime()+30*86400000,start=new Date(`${e.startDate}T00:00:00+08:00`).getTime();return start>new Date(`${today}T00:00:00+08:00`).getTime()&&start<=cutoff;});
@@ -1021,7 +1131,7 @@ export default function AimflowMasterApp() {
 
         {/* Filed status bar — worker */}
         {isWorker && (() => {
-          const mine = filedEntries.filter((e)=>e.checker===session.name);
+          const mine = filedEntries.filter((e)=>e.filedBy===session.name||e.checker===session.name||(e.crew||[]).includes(session.name));
           const pending = mine.filter((e)=>e.status==="pending").length;
           const approved = mine.filter((e)=>e.status==="approved").length;
           const rejected = mine.filter((e)=>e.status==="rejected").length;
@@ -1072,6 +1182,13 @@ export default function AimflowMasterApp() {
           </button>
         )}
 
+        {isWorker && (
+          <button onClick={()=>{setLogPersonName(null);setScreen("personnelLog");}} style={tileStyle()}>
+            <span style={{ ...tileIconStyle, background:PURPLE_LIGHT }}><Users size={22} color={PURPLE} /></span>
+            <span style={{ flex:1 }}><span style={tileTitleStyle}>Team logs</span><span style={tileSubStyle}>Team totals and teammates' job history</span></span>
+          </button>
+        )}
+
         <button onClick={()=>setScreen("leaveBoard")} style={tileStyle()}>
           <span style={{ ...tileIconStyle, background:"#F0FDF4" }}><BedDouble size={22} color={GREEN_DARK} /></span>
           <span style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
@@ -1115,8 +1232,7 @@ export default function AimflowMasterApp() {
             <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"12px 0 8px", textTransform:"uppercase", letterSpacing:0.5 }}>Team hours overview</div>
             {(isAdmin ? ["tanker","jetting","watertank"] : mySupTeams).map((t) => {
               const teamJobs = jobHistory.filter((j)=>j.team===t);
-              const totHrs = teamJobs.reduce((a,j)=>a+parseFloat(j.hours||0),0);
-              const totOT = teamJobs.reduce((a,j)=>a+calcOT(j.checkInTime,j.checkOutTime),0);
+              const { hours: totHrs, ot: totOT } = teamTotals(teamJobs);
               const accent = teamAccent(t);
               return (
                 <div key={t} style={{ display:"flex", alignItems:"center", gap:12, border:`1px solid ${BORDER}`, borderRadius:12, padding:"12px 14px", marginBottom:8, background:"white" }}>
@@ -1258,29 +1374,98 @@ export default function AimflowMasterApp() {
   if (screen === "archiveTools") {
     const totalJobs = jobHistory.length;
     const totalFuel = fuelHistory.length;
+
+    // Range selection: "all" (everything live) or "custom" (pick dates)
+    const rangeMode = archiveRangeMode;
+    const startTs = archiveRangeStart ? new Date(`${archiveRangeStart}T00:00:00+08:00`).getTime() : -Infinity;
+    const endTs = archiveRangeEnd ? new Date(`${archiveRangeEnd}T23:59:59+08:00`).getTime() : Infinity;
+    const inRange = (ts) => ts >= startTs && ts <= endTs;
+    const previewJobs = rangeMode === "custom" ? jobHistory.filter(j => inRange(j.checkInTime)) : jobHistory;
+    const previewFuel = rangeMode === "custom" ? fuelHistory.filter(f => inRange(f.date)) : fuelHistory;
+    const rangeValid = rangeMode === "all" || (archiveRangeStart && archiveRangeEnd && archiveRangeStart <= archiveRangeEnd);
+
+    // Quick presets
+    const setThisMonth = () => {
+      const now = new Date();
+      const first = new Date(now.getFullYear(), now.getMonth(), 1).toLocaleDateString("en-CA");
+      const last = new Date(now.getFullYear(), now.getMonth()+1, 0).toLocaleDateString("en-CA");
+      setArchiveRangeStart(first); setArchiveRangeEnd(last);
+    };
+    const setLastMonth = () => {
+      const now = new Date();
+      const first = new Date(now.getFullYear(), now.getMonth()-1, 1).toLocaleDateString("en-CA");
+      const last = new Date(now.getFullYear(), now.getMonth(), 0).toLocaleDateString("en-CA");
+      setArchiveRangeStart(first); setArchiveRangeEnd(last);
+    };
+
     return (
       <Shell>
         <Header title="Monthly archive & reset" onBack={()=>setScreen("adminTools")} accent={GREEN_DARK} />
+
+        {showArchiveConfirm && (
+          <ConfirmModal
+            title="Archive and reset this data?"
+            body={`This will save a snapshot of ${previewJobs.length} job record${previewJobs.length===1?"":"s"} and ${previewFuel.length} fuel record${previewFuel.length===1?"":"s"}, then permanently remove them from the live app. Make sure you've downloaded the CSV/PDF first if you need a copy outside Opsflow.`}
+            confirmLabel="Archive & reset"
+            confirmColor={GREEN_DARK}
+            icon={Archive}
+            onCancel={()=>setShowArchiveConfirm(false)}
+            onConfirm={async()=>{
+              setShowArchiveConfirm(false);
+              await doArchiveReset(archivePassword, rangeMode==="custom"?archiveRangeStart:null, rangeMode==="custom"?archiveRangeEnd:null);
+            }}
+          />
+        )}
+
         <div style={{ display:"flex", gap:8, background:GREEN_LIGHT, borderRadius:12, padding:"11px 13px", marginBottom:18, fontSize:12, color:GREEN_DARK }}>
           <Archive size={16} style={{ flexShrink:0, marginTop:1 }} />
-          <span>Archive saves a snapshot of all current data, then resets the active logs. Data can be restored at any time.</span>
+          <span>Archive saves a snapshot of the selected data, then removes it from the live app. Data can be restored at any time. Only records within your chosen range are affected — everything else stays live.</span>
         </div>
+
         <div style={{ border:`1px solid ${BORDER}`, borderRadius:13, padding:"14px", marginBottom:16, background:"white" }}>
-          <div style={{ fontSize:12, color:SLATE, marginBottom:4 }}>Current live data</div>
+          <div style={{ fontSize:12, color:SLATE, marginBottom:4 }}>Current live data (all time)</div>
           <div style={{ fontSize:15, fontWeight:700, color:INK }}>{totalJobs} job records · {totalFuel} fuel records</div>
         </div>
+
+        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>What to archive</div>
+        <div style={{ display:"flex", gap:8, marginBottom:14 }}>
+          <button onClick={()=>setArchiveRangeMode("all")} style={{ flex:1, padding:"11px 8px", borderRadius:11, border: rangeMode==="all"?`1.5px solid ${GREEN_DARK}`:`1px solid ${BORDER}`, background: rangeMode==="all"?GREEN_LIGHT:"white", color: rangeMode==="all"?GREEN_DARK:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Everything live</button>
+          <button onClick={()=>setArchiveRangeMode("custom")} style={{ flex:1, padding:"11px 8px", borderRadius:11, border: rangeMode==="custom"?`1.5px solid ${GREEN_DARK}`:`1px solid ${BORDER}`, background: rangeMode==="custom"?GREEN_LIGHT:"white", color: rangeMode==="custom"?GREEN_DARK:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Custom date range</button>
+        </div>
+
+        {rangeMode === "custom" && (
+          <>
+            <div style={{ display:"flex", gap:8, marginBottom:12 }}>
+              <button onClick={setThisMonth} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:12, fontWeight:600, cursor:"pointer" }}>This month</button>
+              <button onClick={setLastMonth} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:12, fontWeight:600, cursor:"pointer" }}>Last month</button>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
+              <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>From</div><input type="date" value={archiveRangeStart} onChange={(e)=>setArchiveRangeStart(e.target.value)} style={{ ...inputStyle, marginBottom:0 }} /></div>
+              <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>To</div><input type="date" value={archiveRangeEnd} min={archiveRangeStart} onChange={(e)=>setArchiveRangeEnd(e.target.value)} style={{ ...inputStyle, marginBottom:0 }} /></div>
+            </div>
+            {rangeValid && (
+              <div style={{ background:BLUE_LIGHT, borderRadius:10, padding:"9px 13px", marginBottom:14, fontSize:12, color:BLUE_DARK, fontWeight:600 }}>
+                {previewJobs.length} job{previewJobs.length===1?"":"s"} and {previewFuel.length} fuel record{previewFuel.length===1?"":"s"} fall within this range
+              </div>
+            )}
+          </>
+        )}
+
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Reset password</div>
         <input type="password" value={archivePassword} onChange={(e)=>{setArchivePassword(e.target.value);setArchiveError(null);}} placeholder="Enter reset password" style={inputStyle} />
         {archiveError && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={15} style={{ flexShrink:0 }} /><span>{archiveError}</span></div>}
         {archiveSuccess && <div style={{ display:"flex", gap:8, background:GREEN_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:GREEN_DARK }}><CheckCircle2 size={15} style={{ flexShrink:0 }} /><span>{archiveSuccess}</span></div>}
+
         <div style={{ display:"flex", gap:10, marginBottom:14 }}>
-          <button onClick={()=>exportJobsCSV(jobHistory)} style={{ flex:1, padding:12, borderRadius:12, border:`1px solid ${BLUE}`, background:"white", color:BLUE, fontSize:13, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Download size={14} /> Jobs CSV</button>
-          <button onClick={()=>exportFuelCSV(fuelHistory)} style={{ flex:1, padding:12, borderRadius:12, border:`1px solid ${AMBER}`, background:"white", color:AMBER_DARK, fontSize:13, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Download size={14} /> Fuel CSV</button>
-          <button onClick={()=>exportPDF(jobHistory,fuelHistory)} style={{ flex:1, padding:12, borderRadius:12, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:13, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Download size={14} /> PDF</button>
+          <button onClick={()=>exportJobsCSV(previewJobs)} style={{ flex:1, padding:12, borderRadius:12, border:`1px solid ${BLUE}`, background:"white", color:BLUE, fontSize:13, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Download size={14} /> Jobs CSV</button>
+          <button onClick={()=>exportFuelCSV(previewFuel)} style={{ flex:1, padding:12, borderRadius:12, border:`1px solid ${AMBER}`, background:"white", color:AMBER_DARK, fontSize:13, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Download size={14} /> Fuel CSV</button>
+          <button onClick={()=>exportPDF(previewJobs,previewFuel)} style={{ flex:1, padding:12, borderRadius:12, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:13, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Download size={14} /> PDF</button>
         </div>
-        <PrimaryButton accent={GREEN_DARK} disabled={!archivePassword.trim()} onClick={()=>doArchiveReset(archivePassword)}>
+
+        <PrimaryButton accent={GREEN_DARK} disabled={!archivePassword.trim() || !rangeValid} onClick={()=>setShowArchiveConfirm(true)}>
           <Archive size={16} /> Archive & Reset
         </PrimaryButton>
+
         {archives.length > 0 && (
           <>
             <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"18px 0 8px", textTransform:"uppercase", letterSpacing:0.5 }}>Past archives</div>
@@ -1295,8 +1480,19 @@ export default function AimflowMasterApp() {
                   <button onClick={()=>exportJobsCSV(arc.jobs)} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${BLUE}`, background:"white", color:BLUE, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><Download size={12} /> Jobs</button>
                   <button onClick={()=>exportFuelCSV(arc.fuel)} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${AMBER}`, background:"white", color:AMBER_DARK, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><Download size={12} /> Fuel</button>
                   <button onClick={()=>exportPDF(arc.jobs,arc.fuel)} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><Download size={12} /> PDF</button>
-                  <button onClick={()=>{restoreArchive(arc);}} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${GREEN}`, background:"white", color:GREEN_DARK, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><RotateCcw size={12} /> Restore</button>
+                  <button onClick={()=>{setRestoreConfirmTarget(arc);}} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${GREEN}`, background:"white", color:GREEN_DARK, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><RotateCcw size={12} /> Restore</button>
                 </div>
+                {restoreConfirmTarget?.id === arc.id && (
+                  <ConfirmModal
+                    title={`Restore ${arc.label}?`}
+                    body="This adds these archived records back into the live app, alongside any current data. It does not remove them from the archive."
+                    confirmLabel="Restore"
+                    confirmColor={GREEN_DARK}
+                    icon={RotateCcw}
+                    onCancel={()=>setRestoreConfirmTarget(null)}
+                    onConfirm={()=>{ restoreArchive(arc); setRestoreConfirmTarget(null); }}
+                  />
+                )}
               </div>
             ))}
           </>
@@ -1962,25 +2158,39 @@ export default function AimflowMasterApp() {
       ...Object.values(filedDraft.crewByVehicle||{}).flat().filter((n)=>n!==CASUAL_LABOUR_OPTION),
       ...Object.values(filedDraft.crewCustomNames||{}).flat().map((n)=>n.trim()).filter(Boolean),
     ])];
+    // The person(s) actually on site are whoever was selected under vehicles/crew —
+    // NOT necessarily the person filing this entry. "checker" is just the primary
+    // name shown in lists; full credit for hours/OT goes to everyone in allCrew.
+    const primaryPerson = allCrew[0] || session.name;
+    const noOneSelected = allCrew.length === 0;
     return (
       <Shell>
         <Header title="Review filed entry" onBack={()=>setScreen("filedJobsheet")} accent="#C2570C" />
         <div style={{ display:"flex", gap:8, background:"#FEF0E6", borderRadius:12, padding:"12px 14px", marginBottom:16, fontSize:12, color:"#7C3D08" }}>
           <FileClock size={16} style={{ flexShrink:0, marginTop:1 }} />
-          <span>Once submitted, a supervisor will review this entry before it counts toward your hours.</span>
+          <span>Once submitted, a supervisor will review this entry before it counts toward the hours of everyone selected under vehicles/crew.</span>
         </div>
+        {noOneSelected && (
+          <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:12, padding:"12px 14px", marginBottom:16, fontSize:12, color:RED }}>
+            <AlertTriangle size={16} style={{ flexShrink:0, marginTop:1 }} />
+            <span>No personnel selected. Go back and select who was actually on site — this entry will not count toward anyone's hours until someone is selected.</span>
+          </div>
+        )}
         <ReviewBlock rows={[
           ["Team", teamLabel(filedDraft.team)],
           ["Site", filedDraft.jobSite],
           ["Check-in", new Date(checkInMs).toLocaleString("en-SG",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"})],
           ["Check-out", new Date(checkOutMs).toLocaleString("en-SG",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"})],
-          ["Hours", `${hours} hrs (${ot.toFixed(1)} OT)`],
-          ["Crew", allCrew.join(", ")||"—"],
+          ["Hours", `${hours} hrs (${ot.toFixed(1)} OT each)`],
+          ["Personnel credited", allCrew.join(", ")||"None selected"],
+          ["Filed by", session.name],
           ["Reason", filedDraft.reason],
         ]} />
-        <PrimaryButton accent="#C2570C" onClick={()=>{
+        <PrimaryButton accent="#C2570C" disabled={noOneSelected} onClick={()=>{
           const entry = {
-            id:`filed-${Date.now()}`, team:filedDraft.team, checker:session.name,
+            id:`filed-${Date.now()}`, team:filedDraft.team,
+            checker: primaryPerson,         // primary name shown in lists/cards
+            filedBy: session.name,          // who actually submitted this filing
             jobSite:filedDraft.jobSite,
             checkInTime:new Date(filedDraft.manualCheckIn).getTime(),
             checkOutTime:new Date(filedDraft.manualCheckOut).getTime(),
@@ -2028,7 +2238,7 @@ export default function AimflowMasterApp() {
         checkInTime:entry.checkInTime, checkOutTime:entry.checkOutTime, hours:entry.hours,
         vehicles:entry.vehicles, crew:entry.crew, crewByVehicle:resolvedCrewByVehicle,
         serviceLines:entry.serviceLines, jobsheet:entry.jobsheet, pubDisposal:entry.pubDisposal,
-        remarks:entry.remarks, wasFiledEntry:true, filedReason:entry.reason, approvedBy:session.name,
+        remarks:entry.remarks, wasFiledEntry:true, filedReason:entry.reason, filedBy:entry.filedBy||entry.checker, approvedBy:session.name,
       };
       addJob(newJob);
     };
@@ -2067,7 +2277,7 @@ export default function AimflowMasterApp() {
 
   // ── My filed entries (worker) ─────────────────────────────────────
   if (screen === "myFiledEntries") {
-    const mine = filedEntries.filter((e)=>e.checker===session.name);
+    const mine = filedEntries.filter((e)=>(e.filedBy===session.name||e.checker===session.name||(e.crew||[]).includes(session.name)));
     const list = mine.filter((e)=>e.status===filedTab);
     const handleWithdraw=(entry)=>deleteFiledEntry(entry.id);
     const handleAmend=(entry)=>{
@@ -2227,8 +2437,8 @@ export default function AimflowMasterApp() {
 
   // ── Logs: my personal log ────────────────────────────────────────
   if (screen === "myJobLog") {
-    const myJobs = [...currentJobHistory.filter((j)=>j.checker===session.name||(j.crew||[]).includes(session.name))].sort((a,b)=>b.checkInTime-a.checkInTime);
-    const totals = myJobs.reduce((acc,j)=>{ acc.hours+=parseFloat(j.hours||0); acc.ot+=calcOT(j.checkInTime,j.checkOutTime); return acc; },{hours:0,ot:0});
+    const myJobs = [...currentJobHistory.filter((j)=>jobCreditedPeople(j).includes(session.name))].sort((a,b)=>b.checkInTime-a.checkInTime);
+    const totals = personTotals(currentJobHistory, session.name);
     return (
       <Shell>
         <Header title="My logs" onBack={()=>setScreen("landing")} />
@@ -2248,7 +2458,7 @@ export default function AimflowMasterApp() {
             <span style={{ ...tileIconStyle, background:"#FEF0E6" }}><FileClock size={20} color="#C2570C" /></span>
             <span style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
               <span><span style={tileTitleStyle}>My filed entries</span><span style={tileSubStyle}>Track your missed check-in filings</span></span>
-              {filedEntries.filter((e)=>e.checker===session.name&&e.status==="pending").length>0 && <span style={{ fontSize:12, fontWeight:800, color:"white", background:"#C2570C", borderRadius:20, padding:"3px 9px", flexShrink:0 }}>{filedEntries.filter((e)=>e.checker===session.name&&e.status==="pending").length}</span>}
+              {filedEntries.filter((e)=>(e.filedBy===session.name||e.checker===session.name||(e.crew||[]).includes(session.name))&&e.status==="pending").length>0 && <span style={{ fontSize:12, fontWeight:800, color:"white", background:"#C2570C", borderRadius:20, padding:"3px 9px", flexShrink:0 }}>{filedEntries.filter((e)=>(e.filedBy===session.name||e.checker===session.name||(e.crew||[]).includes(session.name))&&e.status==="pending").length}</span>}
             </span>
           </button>
         )}
@@ -2335,8 +2545,7 @@ export default function AimflowMasterApp() {
         (j.crew||[]).some((c)=>c.toLowerCase().includes(q))
       );
     }
-    const totHrs=teamJobs.reduce((a,j)=>a+parseFloat(j.hours||0),0);
-    const totOT=teamJobs.reduce((a,j)=>a+calcOT(j.checkInTime,j.checkOutTime),0);
+    const { hours: totHrs, ot: totOT } = teamTotals(teamJobs);
     const sortOptions=[{key:"date_desc",label:"Newest"},{key:"date_asc",label:"Oldest"},{key:"name_asc",label:"Checker A–Z"},{key:"site_asc",label:"Site A–Z"}];
     return (
       <Shell>
@@ -2415,12 +2624,34 @@ export default function AimflowMasterApp() {
       ? userDirectory.filter((u)=>u.role==="worker"||u.role==="supervisor").map((u)=>u.name).sort((a,b)=>a.localeCompare(b))
       : userDirectory.filter((u)=>u.role==="worker"&&u.team===session.team).map((u)=>u.name).sort((a,b)=>a.localeCompare(b));
     const involvedTarget = logPersonName || session.name;
-    let myJobs = [...currentJobHistory.filter((j)=>j.checker===involvedTarget||(j.crew||[]).includes(involvedTarget))].sort((a,b)=>b.checkInTime-a.checkInTime);
-    const totals = myJobs.reduce((acc,j)=>{ acc.hours+=parseFloat(j.hours||0); acc.ot+=calcOT(j.checkInTime,j.checkOutTime); return acc; },{hours:0,ot:0});
+    let myJobs = [...currentJobHistory.filter((j)=>jobCreditedPeople(j).includes(involvedTarget))].sort((a,b)=>b.checkInTime-a.checkInTime);
+    const totals = personTotals(currentJobHistory, involvedTarget);
     const otVisible = canSeeOT(session,involvedTarget);
+    // Team total (aggregate, payroll view) — visible to everyone, OT is never broken down per-person here
+    const myOwnTeam = userDirectory.find((u)=>u.name===session.name)?.team || session.team;
+    const relevantTeams = canPickAnyone ? ["tanker","jetting","watertank"] : [myOwnTeam].filter(Boolean);
     return (
       <Shell>
-        <Header title="Personnel log" onBack={()=>setScreen("logsHome")} accent={PURPLE} />
+        <Header title="Personnel log" onBack={()=>setScreen(isWorker?"landing":"logsHome")} accent={PURPLE} />
+
+        {/* Team totals — aggregate only, no per-person OT exposure */}
+        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Team totals</div>
+        {relevantTeams.map((t) => {
+          const teamJobs = currentJobHistory.filter((j)=>j.team===t);
+          const { hours, ot } = teamTotals(teamJobs);
+          const accent = teamAccent(t);
+          return (
+            <div key={t} style={{ display:"flex", alignItems:"center", gap:12, border:`1px solid ${BORDER}`, borderRadius:12, padding:"12px 14px", marginBottom:8, background:"white" }}>
+              <TeamIcon team={t} size={18} color={accent} />
+              <span style={{ fontSize:13, fontWeight:700, color:INK, flex:1 }}>{teamLabel(t)}</span>
+              <span style={{ fontSize:12, color:SLATE, fontWeight:600 }}>{hours.toFixed(1)} hrs</span>
+              <span style={{ fontSize:12, color:AMBER_DARK, fontWeight:700, background:AMBER_LIGHT, borderRadius:8, padding:"3px 9px" }}>{ot.toFixed(1)} OT</span>
+            </div>
+          );
+        })}
+        <div style={{ fontSize:10.5, color:SLATE_LIGHT, fontStyle:"italic", marginBottom:18 }}>Team totals are combined across everyone on the team — individual hours below are private.</div>
+
+        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Individual logs</div>
         <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>{canPickAnyone?"Select a person":"Select a teammate"}</div>
         <PickList label="Select one" options={pickableNames} selected={logPersonName} multi={false} accent={PURPLE} onToggle={(val)=>setLogPersonName(val)} />
         {logPersonName && (
@@ -2768,7 +2999,7 @@ export default function AimflowMasterApp() {
                   </div>
                 </div>
                 {canEditUser(u) ? (
-                  <button onClick={()=>{setPinEditTarget(u.name);setPinEditValue(u.pin.startsWith("REVOKED")?"":u.pin);setScreen("adminPinEdit");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:9, padding:"7px 12px", fontSize:12, fontWeight:600, color:PURPLE, cursor:"pointer" }}>Edit</button>
+                  <button onClick={()=>{setPinEditTarget(u.name);setPinEditValue(u.pin.startsWith("REVOKED")?"":u.pin);setPinEditConfirmAction(null);setScreen("adminPinEdit");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:9, padding:"7px 12px", fontSize:12, fontWeight:600, color:PURPLE, cursor:"pointer" }}>Edit</button>
                 ) : (
                   <span style={{ fontSize:11, color:SLATE_LIGHT, padding:"7px 12px" }}>—</span>
                 )}
@@ -2883,12 +3114,38 @@ export default function AimflowMasterApp() {
     const target = userDirectory.find((u) => u.name === pinEditTarget);
     const isDuplicate = userDirectory.some((u) => u.name !== pinEditTarget && u.pin === pinEditValue.toUpperCase());
     const isPinBeta = pinEditValue.toUpperCase() === "B0000";
-    // Supervisors cannot edit other supervisors or admin; only admin can do that
-    const canEditRole = isAdmin || target?.role === "worker";
-    if (!canEditRole) { setScreen("adminUsers"); return null; }
+    // Supervisors can edit/revoke/remove workers only; admin can act on anyone (except themselves / Master Admin for remove)
+    const canActOnTarget = isAdmin || target?.role === "worker";
+    if (!canActOnTarget) { setScreen("adminUsers"); return null; }
+    const canRemove = target?.name !== "Master Admin" && target?.name !== session.name;
     return (
       <Shell>
         <Header title={`Edit — ${pinEditTarget}`} onBack={()=>setScreen("adminUsers")} accent={PURPLE} />
+
+        {pinEditConfirmAction === "remove" && (
+          <ConfirmModal
+            title={`Remove ${target?.name}?`}
+            body="This permanently removes their access to Opsflow. Their existing job and fuel history is kept for records, but they will no longer be able to log in. This cannot be undone from the app — you would need to add them back as a new user."
+            confirmLabel="Remove user"
+            onCancel={()=>setPinEditConfirmAction(null)}
+            onConfirm={()=>{ removeUser(pinEditTarget); setEditUserTeam(undefined); setPinEditConfirmAction(null); setScreen("adminUsers"); }}
+          />
+        )}
+        {pinEditConfirmAction === "revoke" && (
+          <ConfirmModal
+            title={`Revoke ${target?.name}'s access?`}
+            body="Their PIN will stop working immediately. The user stays in the system and can be re-issued a new PIN later."
+            confirmLabel="Revoke access"
+            confirmColor={AMBER_DARK}
+            onCancel={()=>setPinEditConfirmAction(null)}
+            onConfirm={()=>{
+              const revoked = `REVOKED-${Math.floor(Math.random()*90000+10000)}`;
+              updateUser(pinEditTarget, { ...userDirectory.find(u=>u.name===pinEditTarget)||{}, pin: revoked });
+              setEditUserTeam(undefined); setPinEditConfirmAction(null); setScreen("adminUsers");
+            }}
+          />
+        )}
+
         <div style={{ border:`1px solid ${BORDER}`, borderRadius:13, padding:"13px 14px", marginBottom:16, background:"white" }}>
           <div style={{ fontSize:14, fontWeight:700, color:INK }}>{target?.name}</div>
           <div style={{ fontSize:11, color:SLATE_LIGHT }}>
@@ -2926,26 +3183,17 @@ export default function AimflowMasterApp() {
           setScreen("adminUsers");
         }}><KeyRound size={16} /> Save changes</PrimaryButton>
 
-        {/* Remove user — admin only, cannot remove themselves or Master Admin */}
-        {isAdmin && target?.name !== "Master Admin" && target?.name !== session.name && (
-          <button onClick={()=>{
-            removeUser(pinEditTarget);
-            setEditUserTeam(undefined);
-            setScreen("adminUsers");
-          }} style={{ width:"100%", marginTop:8, padding:13, borderRadius:12, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:13, fontWeight:700, cursor:"pointer" }}>
-            Remove user
+        {/* Revoke access — admin on anyone (except Master Admin); supervisor on workers only */}
+        {(isAdmin || target?.role === "worker") && target?.name !== "Master Admin" && !target?.pin.startsWith("REVOKED") && (
+          <button onClick={()=>setPinEditConfirmAction("revoke")} style={{ width:"100%", marginTop:8, padding:13, borderRadius:12, border:`1px solid ${AMBER}`, background:"white", color:AMBER_DARK, fontSize:13, fontWeight:700, cursor:"pointer" }}>
+            Revoke access (keep user, disable PIN)
           </button>
         )}
 
-        {/* Revoke access — admin only */}
-        {isAdmin && !target?.pin.startsWith("REVOKED") && (
-          <button onClick={()=>{
-            const revoked = `REVOKED-${Math.floor(Math.random()*90000+10000)}`;
-            updateUser(pinEditTarget, { ...userDirectory.find(u=>u.name===pinEditTarget)||{}, pin: revoked });
-            setEditUserTeam(undefined);
-            setScreen("adminUsers");
-          }} style={{ width:"100%", marginTop:8, padding:13, borderRadius:12, border:`1px solid ${AMBER}`, background:"white", color:AMBER_DARK, fontSize:13, fontWeight:700, cursor:"pointer" }}>
-            Revoke access (keep user, disable PIN)
+        {/* Remove user — admin on anyone (except self/Master Admin); supervisor on workers only */}
+        {(isAdmin || target?.role === "worker") && canRemove && (
+          <button onClick={()=>setPinEditConfirmAction("remove")} style={{ width:"100%", marginTop:8, padding:13, borderRadius:12, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:13, fontWeight:700, cursor:"pointer" }}>
+            Remove user
           </button>
         )}
       </Shell>
@@ -2965,6 +3213,15 @@ export default function AimflowMasterApp() {
     return (
       <Shell>
         <Header title="Team leave board" onBack={()=>setScreen("landing")} accent={GREEN_DARK} />
+        {leaveDeleteTarget && (
+          <ConfirmModal
+            title="Remove this leave entry?"
+            body={`This removes ${leaveDeleteTarget.name}'s ${leaveTypeInfo(leaveDeleteTarget.type).label} from the board.`}
+            confirmLabel="Remove"
+            onCancel={()=>setLeaveDeleteTarget(null)}
+            onConfirm={()=>{ deleteLeave(leaveDeleteTarget.id); setLeaveDeleteTarget(null); }}
+          />
+        )}
         <PrimaryButton accent={GREEN_DARK} onClick={()=>{setLeaveDraft(emptyLeaveDraft());setLeaveEditTarget(null);setScreen("leavePost");}}>
           <CalendarDays size={16} /> Post leave / absence
         </PrimaryButton>
@@ -2985,7 +3242,7 @@ export default function AimflowMasterApp() {
               {canEdit(e) && (
                 <div style={{ display:"flex", flexDirection:"column", gap:6, flexShrink:0 }}>
                   <button onClick={()=>{setLeaveDraft({type:e.type,startDate:e.startDate,endDate:e.endDate,note:e.note||""});setLeaveEditTarget(e.id);setScreen("leavePost");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:8, padding:"5px 10px", fontSize:11, fontWeight:600, color:BLUE, cursor:"pointer" }}>Edit</button>
-                  <button onClick={()=>deleteLeave(e.id)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:8, padding:"5px 10px", fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
+                  <button onClick={()=>setLeaveDeleteTarget(e)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:8, padding:"5px 10px", fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
                 </div>
               )}
             </div>
@@ -3008,7 +3265,7 @@ export default function AimflowMasterApp() {
                   {canEdit(e) && (
                     <div style={{ display:"flex", flexDirection:"column", gap:6, flexShrink:0 }}>
                       <button onClick={()=>{setLeaveDraft({type:e.type,startDate:e.startDate,endDate:e.endDate,note:e.note||""});setLeaveEditTarget(e.id);setScreen("leavePost");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:8, padding:"5px 10px", fontSize:11, fontWeight:600, color:BLUE, cursor:"pointer" }}>Edit</button>
-                      <button onClick={()=>deleteLeave(e.id)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:8, padding:"5px 10px", fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
+                      <button onClick={()=>setLeaveDeleteTarget(e)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:8, padding:"5px 10px", fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
                     </div>
                   )}
                 </div>
@@ -3044,6 +3301,15 @@ export default function AimflowMasterApp() {
     return (
       <Shell>
         <Header title={`${teamLabel(leaveBoardTeam)} team — leave`} onBack={()=>setScreen("leaveBoard")} accent={teamAccent(leaveBoardTeam)} />
+        {leaveDeleteTarget && (
+          <ConfirmModal
+            title="Remove this leave entry?"
+            body={`This removes ${leaveDeleteTarget.name}'s ${leaveTypeInfo(leaveDeleteTarget.type).label} from the board.`}
+            confirmLabel="Remove"
+            onCancel={()=>setLeaveDeleteTarget(null)}
+            onConfirm={()=>{ deleteLeave(leaveDeleteTarget.id); setLeaveDeleteTarget(null); }}
+          />
+        )}
         <PrimaryButton accent={teamAccent(leaveBoardTeam)} onClick={()=>{setLeaveDraft(emptyLeaveDraft());setLeaveEditTarget(null);setScreen("leavePost");}}>
           <CalendarDays size={16} /> Post leave / absence
         </PrimaryButton>
@@ -3072,7 +3338,7 @@ export default function AimflowMasterApp() {
                     {canEdit(e) && (
                       <div style={{ display:"flex", gap:6 }}>
                         <button onClick={()=>{setLeaveDraft({type:e.type,startDate:e.startDate,endDate:e.endDate,note:e.note||""});setLeaveEditTarget(e.id);setScreen("leavePost");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:7, padding:"4px 9px", fontSize:11, fontWeight:600, color:BLUE, cursor:"pointer" }}>Edit</button>
-                        <button onClick={()=>deleteLeave(e.id)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:7, padding:"4px 9px", fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
+                        <button onClick={()=>setLeaveDeleteTarget(e)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:7, padding:"4px 9px", fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
                       </div>
                     )}
                   </div>
@@ -3135,7 +3401,16 @@ export default function AimflowMasterApp() {
         }}>
           <CalendarDays size={16} /> {isEditing?"Save changes":"Post leave"}
         </PrimaryButton>
-        {isEditing && <button onClick={()=>{deleteLeave(leaveEditTarget);setLeaveDraft(null);setLeaveEditTarget(null);setScreen("leaveBoard");}} style={{ width:"100%", padding:13, borderRadius:12, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:13, fontWeight:700, cursor:"pointer" }}>Delete this entry</button>}
+        {isEditing && <button onClick={()=>setShowLeavePostDeleteConfirm(true)} style={{ width:"100%", padding:13, borderRadius:12, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:13, fontWeight:700, cursor:"pointer" }}>Delete this entry</button>}
+        {showLeavePostDeleteConfirm && (
+          <ConfirmModal
+            title="Delete this leave entry?"
+            body="This permanently removes this leave posting from the board."
+            confirmLabel="Delete"
+            onCancel={()=>setShowLeavePostDeleteConfirm(false)}
+            onConfirm={()=>{ deleteLeave(leaveEditTarget); setShowLeavePostDeleteConfirm(false); setLeaveDraft(null); setLeaveEditTarget(null); setScreen("leaveBoard"); }}
+          />
+        )}
       </Shell>
     );
   }
