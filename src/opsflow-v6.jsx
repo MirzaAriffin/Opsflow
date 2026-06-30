@@ -90,19 +90,20 @@ const BETA_TEST_USER = {name:"Beta Tester",role:"beta",team:null,pin:"B0000"};
 const CASUAL_LABOUR_OPTION = "Casual labour (type name)";
 
 function sortedWorkers(team,dir=USERS_DEFAULT) {
-  // Workers on this team, plus supervisors assigned to this team (e.g. Mirza for tanker, Kassim for all three).
-  const workers = dir.filter(u=>u.role==="worker"&&u.team===team);
-  const sups = dir.filter(u=>u.role==="supervisor"&&(u.supervisorTeams||[]).includes(team));
-  return [...workers, ...sups].map(u=>u.name).sort((a,b)=>a.localeCompare(b));
+  return dir.filter(u=>u.role==="worker"&&u.team===team).map(u=>u.name).sort((a,b)=>a.localeCompare(b));
+}
+function sortedSupervisorsForTeam(team,dir=USERS_DEFAULT) {
+  return dir.filter(u=>u.role==="supervisor"&&(u.supervisorTeams||[]).includes(team)).map(u=>u.name).sort((a,b)=>a.localeCompare(b));
 }
 function buildTeamWorkerOptions(team,dir=USERS_DEFAULT) {
   const own = sortedWorkers(team,dir);
+  const supervisors = sortedSupervisorsForTeam(team,dir);
   const otherTeams = ["tanker","jetting","watertank"].filter(t=>t!==team);
-  // "Other" = workers/supervisors from other teams, excluding anyone already counted in "own"
-  // (e.g. Kassim covers all teams, so he should only show once, in "own").
+  // "Other" = workers from other teams only (not their supervisors — supervisors get their own
+  // dedicated group above, regardless of which team they're assigned to).
   const otherRaw = otherTeams.flatMap(t=>sortedWorkers(t,dir));
   const other = [...new Set(otherRaw)].filter(name=>!own.includes(name));
-  return {own,other,flat:[...own,...other,CASUAL_LABOUR_OPTION]};
+  return {own,supervisors,other,flat:[...own,...supervisors,...other,CASUAL_LABOUR_OPTION]};
 }
 function teamWorkerOptions(team,dir=USERS_DEFAULT) { return buildTeamWorkerOptions(team,dir); }
 function isJettingVehicle(label) { return label&&label.startsWith("Jetting Truck"); }
@@ -181,6 +182,7 @@ const COL = {
   archives:   "archives",
   settings:   "settings",
   users:      "users",
+  vehicles:   "vehicles",
 };
 
 // ── useFireCollection: real-time listener for a collection ────────────
@@ -235,6 +237,96 @@ async function fsDeleteWhere(colName, field, value) {
   const batch = writeBatch(db);
   snap.docs.filter(d => d.data()[field] === value).forEach(d => batch.delete(d.ref));
   await batch.commit();
+}
+
+// Rename a person across every historical record that references their name.
+// This does NOT touch archives (frozen point-in-time snapshots — renaming the live
+// person shouldn't silently rewrite a permanent archived record of the past).
+async function fsRenamePerson(oldName, newName) {
+  // jobs: checker (string), crew (array)
+  {
+    const snap = await getDocs(collection(db, COL.jobs));
+    const batch = writeBatch(db);
+    let touched = false;
+    snap.docs.forEach(d => {
+      const data = d.data();
+      const update = {};
+      if (data.checker === oldName) update.checker = newName;
+      if (Array.isArray(data.crew) && data.crew.includes(oldName)) update.crew = data.crew.map(n => n === oldName ? newName : n);
+      if (data.approvedBy === oldName) update.approvedBy = newName;
+      if (data.lastEditedBy === oldName) update.lastEditedBy = newName;
+      if (data.filedBy === oldName) update.filedBy = newName;
+      if (Object.keys(update).length) { batch.update(d.ref, update); touched = true; }
+    });
+    if (touched) await batch.commit();
+  }
+  // fuel: person (string)
+  {
+    const snap = await getDocs(collection(db, COL.fuel));
+    const batch = writeBatch(db);
+    let touched = false;
+    snap.docs.forEach(d => {
+      if (d.data().person === oldName) { batch.update(d.ref, { person: newName }); touched = true; }
+    });
+    if (touched) await batch.commit();
+  }
+  // filed: checker, crew[], filedBy, approvedBy
+  {
+    const snap = await getDocs(collection(db, COL.filed));
+    const batch = writeBatch(db);
+    let touched = false;
+    snap.docs.forEach(d => {
+      const data = d.data();
+      const update = {};
+      if (data.checker === oldName) update.checker = newName;
+      if (Array.isArray(data.crew) && data.crew.includes(oldName)) update.crew = data.crew.map(n => n === oldName ? newName : n);
+      if (data.filedBy === oldName) update.filedBy = newName;
+      if (data.approvedBy === oldName) update.approvedBy = newName;
+      if (Object.keys(update).length) { batch.update(d.ref, update); touched = true; }
+    });
+    if (touched) await batch.commit();
+  }
+  // leave: name, postedBy
+  {
+    const snap = await getDocs(collection(db, COL.leave));
+    const batch = writeBatch(db);
+    let touched = false;
+    snap.docs.forEach(d => {
+      const data = d.data();
+      const update = {};
+      if (data.name === oldName) update.name = newName;
+      if (data.postedBy === oldName) update.postedBy = newName;
+      if (Object.keys(update).length) { batch.update(d.ref, update); touched = true; }
+    });
+    if (touched) await batch.commit();
+  }
+  // settings: supervisorTeamPrefs keyed by name, removedUsers array of names
+  {
+    const settingsSnap = await getDoc(doc(db, COL.settings, "config"));
+    if (settingsSnap.exists()) {
+      const data = settingsSnap.data();
+      const update = {};
+      if (data.supervisorTeamPrefs && data.supervisorTeamPrefs[oldName]) {
+        const nextPrefs = { ...data.supervisorTeamPrefs };
+        nextPrefs[newName] = nextPrefs[oldName];
+        delete nextPrefs[oldName];
+        update.supervisorTeamPrefs = nextPrefs;
+      }
+      if (Array.isArray(data.removedUsers) && data.removedUsers.includes(oldName)) {
+        update.removedUsers = data.removedUsers.map(n => n === oldName ? newName : n);
+      }
+      if (Object.keys(update).length) await fsSet(COL.settings, "config", { ...data, ...update });
+    }
+  }
+  // users: move the user doc itself from oldName -> newName (doc ID is the name)
+  {
+    const oldSnap = await getDoc(doc(db, COL.users, oldName));
+    if (oldSnap.exists()) {
+      const userData = oldSnap.data();
+      await setDoc(doc(db, COL.users, newName), { ...userData, name: newName });
+      await deleteDoc(doc(db, COL.users, oldName));
+    }
+  }
 }
 
 // ── localStorage (session-local only) ────────────────────────────────
@@ -292,6 +384,15 @@ const inputStyle = {
   width:"100%", padding:"13px 14px", borderRadius:12, border:`1px solid ${BORDER}`,
   fontSize:14, color:INK, background:"white", marginBottom:14, boxSizing:"border-box",
   fontFamily:"inherit", outline:"none",
+};
+
+// datetime-local's native picker UI can ignore width:100% on some Android/Chrome
+// versions, overflowing the parent. minWidth:0 lets the box-model constraint actually
+// win over the input's intrinsic content width; maxWidth keeps it pinned regardless.
+const datetimeInputStyle = {
+  ...inputStyle,
+  minWidth: 0,
+  maxWidth: "100%",
 };
 
 function PrimaryButton({ children, onClick, disabled, accent }) {
@@ -565,23 +666,37 @@ function FuelStatusCard({ lastFillUp }) {
   );
   const daysAgo = Math.floor((Date.now()-lastFillUp.date)/86400000);
   const whenLabel = daysAgo===0?"today":daysAgo===1?"yesterday":`${daysAgo} days ago`;
+  const cpl = lastFillUp.amount && lastFillUp.price && parseFloat(lastFillUp.amount) > 0
+    ? (parseFloat(lastFillUp.price)/parseFloat(lastFillUp.amount)).toFixed(3) : null;
   return (
-    <div style={{ background:`linear-gradient(135deg, ${AMBER}, ${AMBER_DARK})`, borderRadius:16, padding:17, color:"white", marginBottom:14, boxShadow:`0 8px 20px ${AMBER}33` }}>
-      <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:10 }}>
-        <Fuel size={13} color="#FFE8CC" />
-        <span style={{ fontSize:11, fontWeight:700, letterSpacing:0.6, opacity:0.92 }}>LAST FILL-UP · {whenLabel.toUpperCase()}</span>
+    <div style={{ border:`1px solid ${BORDER}`, borderRadius:16, background:"white", marginBottom:14, overflow:"hidden" }}>
+      <div style={{ display:"flex", alignItems:"center", gap:8, padding:"12px 16px", borderBottom:`1px solid ${BORDER}`, background:AMBER_LIGHT }}>
+        <Fuel size={14} color={AMBER_DARK} />
+        <span style={{ fontSize:11, fontWeight:700, letterSpacing:0.6, color:AMBER_DARK }}>LAST FILL-UP · {whenLabel.toUpperCase()}</span>
       </div>
-      <div style={{ fontSize:15.5, fontWeight:700 }}>{lastFillUp.vehicle}</div>
-      <div style={{ fontSize:12, opacity:0.82, marginBottom:2 }}>
-        {new Date(lastFillUp.date).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
-        {" · "}{new Date(lastFillUp.date).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
-      </div>
-      <div style={{ fontSize:12, opacity:0.82, marginBottom:12, fontWeight:600 }}>Filled by {lastFillUp.person}</div>
-      <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
-        <span style={pillStyle}>⛽ {lastFillUp.amount} L</span>
-        <span style={pillStyle}>💵 S${lastFillUp.price}</span>
-        <span style={pillStyle}>🏷️ {lastFillUp.company}</span>
-        {lastFillUp.mileage && <span style={pillStyle}>📍 {lastFillUp.mileage} km</span>}
+      <div style={{ padding:"13px 16px" }}>
+        <div style={{ fontSize:15, fontWeight:700, color:INK, marginBottom:2 }}>{lastFillUp.vehicle}</div>
+        <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
+          {new Date(lastFillUp.date).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
+          {" · "}{new Date(lastFillUp.date).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+          {" · Filled by "}{lastFillUp.person}
+        </div>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:0 }}>
+          <div style={{ borderRight:`1px solid ${BORDER}`, paddingRight:12 }}>
+            <div style={{ fontSize:10, color:SLATE_LIGHT, fontWeight:700, letterSpacing:0.3, marginBottom:3, textTransform:"uppercase" }}>Litres</div>
+            <div style={{ fontSize:15, fontWeight:800, color:INK }}>{parseFloat(lastFillUp.amount).toFixed(1)}</div>
+          </div>
+          <div style={{ borderRight:`1px solid ${BORDER}`, paddingLeft:12, paddingRight:12 }}>
+            <div style={{ fontSize:10, color:SLATE_LIGHT, fontWeight:700, letterSpacing:0.3, marginBottom:3, textTransform:"uppercase" }}>Total</div>
+            <div style={{ fontSize:15, fontWeight:800, color:INK }}>S${parseFloat(lastFillUp.price).toFixed(2)}</div>
+            {cpl && <div style={{ fontSize:10, color:GREEN_DARK, fontWeight:600 }}>S${cpl}/L</div>}
+          </div>
+          <div style={{ paddingLeft:12 }}>
+            <div style={{ fontSize:10, color:SLATE_LIGHT, fontWeight:700, letterSpacing:0.3, marginBottom:3, textTransform:"uppercase" }}>Station</div>
+            <div style={{ fontSize:13, fontWeight:700, color:INK }}>{lastFillUp.company}</div>
+            {lastFillUp.mileage && <div style={{ fontSize:10, color:SLATE_LIGHT }}>{lastFillUp.mileage} km</div>}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -617,7 +732,7 @@ function JobDetailDropdown({ job: j }) {
 function TeamLastJobCard({ team, jobHistory, filedEntries, onClick }) {
   const accent = teamAccent(team);
   const lastJob = [...jobHistory].filter((j) => j.team === team).sort((a,b) => b.checkOutTime - a.checkOutTime)[0];
-  const pendingForTeam = filedEntries.filter((e) => e.team === team && e.status === "pending").length;
+  // Pending count intentionally not shown here — already surfaced on the "Review filed entries" tile, avoids duplicate badges on the dashboard.
 
   return (
     <button onClick={onClick} style={{ width:"100%", display:"flex", flexDirection:"column", gap:0, borderRadius:14, border:`1px solid ${accent}33`, background:`${accent}08`, marginBottom:10, cursor:"pointer", textAlign:"left", overflow:"hidden" }}>
@@ -626,9 +741,6 @@ function TeamLastJobCard({ team, jobHistory, filedEntries, onClick }) {
           <TeamIcon team={team} size={16} color={accent} />
           <span style={{ fontSize:13, fontWeight:700, color:accent }}>{teamLabel(team)} team</span>
         </div>
-        {pendingForTeam > 0 && (
-          <span style={{ fontSize:11, fontWeight:800, color:"white", background:"#C2570C", borderRadius:20, padding:"2px 8px" }}>{pendingForTeam} pending</span>
-        )}
       </div>
       {lastJob ? (
         <div style={{ padding:"10px 14px" }}>
@@ -649,7 +761,7 @@ function TeamLastJobCard({ team, jobHistory, filedEntries, onClick }) {
           {lastJob.crew?.length > 0 && (
             <div style={{ display:"flex", flexWrap:"wrap", gap:5, marginBottom: lastJob.remarks ? 8 : 0 }}>
               {lastJob.crew.map((name) => (
-                <span key={name} style={{ fontSize:10.5, fontWeight:600, padding:"2px 8px", borderRadius:6, background:"white", color:"#374151", border:`1px solid ${BORDER}` }}>👷 {name}</span>
+                <span key={name} style={{ display:"inline-flex", alignItems:"center", gap:4, fontSize:10.5, fontWeight:600, padding:"2px 8px", borderRadius:6, background:"white", color:"#374151", border:`1px solid ${BORDER}` }}><Users size={10} color="#6B7280" />{name}</span>
               ))}
             </div>
           )}
@@ -686,14 +798,16 @@ function OfflineBanner() {
 // ── Logout confirmation modal ────────────────────────────────────────
 function LogoutModal({ onConfirm, onCancel }) {
   return (
-    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999, padding:20 }}>
-      <div style={{ background:"white", borderRadius:20, padding:24, maxWidth:340, width:"100%", textAlign:"center" }}>
-        <LogOut size={32} color={SLATE} style={{ marginBottom:12 }} />
-        <div style={{ fontSize:16, fontWeight:700, color:INK, marginBottom:8 }}>Log out?</div>
-        <div style={{ fontSize:13, color:SLATE, marginBottom:20 }}>Your data is saved. You'll need your PIN to log back in.</div>
+    <div style={{ position:"fixed", inset:0, background:"rgba(17,24,39,0.55)", backdropFilter:"blur(2px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999, padding:20 }}>
+      <div style={{ background:"white", borderRadius:22, padding:"28px 24px 24px", maxWidth:340, width:"100%", textAlign:"center", boxShadow:"0 24px 60px rgba(17,24,39,0.25)" }}>
+        <div style={{ width:56, height:56, borderRadius:16, background:`${SLATE}14`, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 16px" }}>
+          <LogOut size={26} color={SLATE} />
+        </div>
+        <div style={{ fontSize:16.5, fontWeight:700, color:INK, marginBottom:8, letterSpacing:-0.2 }}>Log out?</div>
+        <div style={{ fontSize:13, color:SLATE, marginBottom:22, lineHeight:1.55 }}>Your data is saved. You'll need your PIN to log back in.</div>
         <div style={{ display:"flex", gap:10 }}>
           <button onClick={onCancel} style={{ flex:1, padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:14, fontWeight:600, cursor:"pointer" }}>Cancel</button>
-          <button onClick={onConfirm} style={{ flex:1, padding:13, borderRadius:12, border:"none", background:RED, color:"white", fontSize:14, fontWeight:700, cursor:"pointer" }}>Log out</button>
+          <button onClick={onConfirm} style={{ flex:1, padding:13, borderRadius:12, border:"none", background:RED, color:"white", fontSize:14, fontWeight:700, cursor:"pointer", boxShadow:`0 4px 12px ${RED}40` }}>Log out</button>
         </div>
       </div>
     </div>
@@ -704,14 +818,16 @@ function LogoutModal({ onConfirm, onCancel }) {
 // reset archive, delete logs, etc). Every deletion/reset in the app must route through this.
 function ConfirmModal({ title, body, confirmLabel = "Confirm", confirmColor = RED, icon: Icon = AlertTriangle, onConfirm, onCancel }) {
   return (
-    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999, padding:20 }}>
-      <div style={{ background:"white", borderRadius:20, padding:24, maxWidth:360, width:"100%", textAlign:"center" }}>
-        <Icon size={32} color={confirmColor} style={{ marginBottom:12 }} />
-        <div style={{ fontSize:16, fontWeight:700, color:INK, marginBottom:8 }}>{title}</div>
-        <div style={{ fontSize:13, color:SLATE, marginBottom:20, lineHeight:1.5 }}>{body}</div>
+    <div style={{ position:"fixed", inset:0, background:"rgba(17,24,39,0.55)", backdropFilter:"blur(2px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999, padding:20 }}>
+      <div style={{ background:"white", borderRadius:22, padding:"28px 24px 24px", maxWidth:360, width:"100%", textAlign:"center", boxShadow:"0 24px 60px rgba(17,24,39,0.25)" }}>
+        <div style={{ width:56, height:56, borderRadius:16, background:`${confirmColor}14`, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 16px" }}>
+          <Icon size={26} color={confirmColor} />
+        </div>
+        <div style={{ fontSize:16.5, fontWeight:700, color:INK, marginBottom:8, letterSpacing:-0.2 }}>{title}</div>
+        <div style={{ fontSize:13, color:SLATE, marginBottom:22, lineHeight:1.55 }}>{body}</div>
         <div style={{ display:"flex", gap:10 }}>
           <button onClick={onCancel} style={{ flex:1, padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:14, fontWeight:600, cursor:"pointer" }}>Cancel</button>
-          <button onClick={onConfirm} style={{ flex:1, padding:13, borderRadius:12, border:"none", background:confirmColor, color:"white", fontSize:14, fontWeight:700, cursor:"pointer" }}>{confirmLabel}</button>
+          <button onClick={onConfirm} style={{ flex:1, padding:13, borderRadius:12, border:"none", background:confirmColor, color:"white", fontSize:14, fontWeight:700, cursor:"pointer", boxShadow:`0 4px 12px ${confirmColor}40` }}>{confirmLabel}</button>
         </div>
       </div>
     </div>
@@ -731,7 +847,7 @@ function AppHeader({ session, onLogout }) {
         <div style={{ position:"absolute", bottom:-30, left:-20, width:100, height:100, borderRadius:"50%", background:"rgba(255,255,255,0.03)" }} />
         {/* Centred wordmark */}
         <div style={{ textAlign:"center", marginBottom:16, position:"relative" }}>
-          <div style={{ fontSize:26, fontWeight:900, color:"white", letterSpacing:-0.6, lineHeight:1 }}>Opsflow</div>
+          <div style={{ fontSize:26, fontWeight:900, color:"white", letterSpacing:-0.6, lineHeight:1 }}>OPSFLOW</div>
           <div style={{ fontSize:10.5, color:"rgba(255,255,255,0.5)", fontWeight:600, letterSpacing:0.5, marginTop:3 }}>AIMFLOW PTE LTD · FIELD OPERATIONS</div>
         </div>
         {/* User row */}
@@ -820,6 +936,7 @@ export default function AimflowMasterApp() {
   const [leaveEntries,  leaveLoading]   = useFireCollection(COL.leave);
   const [archives,      archivesLoading]= useFireCollection(COL.archives);
   const [remoteUsers,   usersLoading]   = useFireCollection(COL.users);
+  const [remoteVehicles,vehiclesLoading]= useFireCollection(COL.vehicles);
   const settingsDoc = useFireDoc(COL.settings, "config", null);
   const resetPassword = settingsDoc?.resetPassword || "RESET2025";
   const supervisorTeamPrefs = settingsDoc?.supervisorTeamPrefs || {};
@@ -873,6 +990,11 @@ export default function AimflowMasterApp() {
   const [leaveBoardTeam, setLeaveBoardTeam] = useState(null);
   const [archivePassword, setArchivePassword] = useState("");
   const [archiveRangeMode, setArchiveRangeMode] = useState("all"); // "all" | "custom"
+  const [archiveTeamFilter, setArchiveTeamFilter] = useState(null); // null | "tanker" | "jetting" | "watertank"
+  const [vehicleEditTarget, setVehicleEditTarget] = useState(null); // null = adding new, else the vehicle doc being edited
+  const [newVehiclePlate, setNewVehiclePlate] = useState("");
+  const [newVehicleTeam, setNewVehicleTeam] = useState("tanker");
+  const [vehicleDeleteTarget, setVehicleDeleteTarget] = useState(null);
   const [archiveRangeStart, setArchiveRangeStart] = useState("");
   const [archiveRangeEnd, setArchiveRangeEnd] = useState("");
   const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
@@ -886,7 +1008,8 @@ export default function AimflowMasterApp() {
   const [longJobWarningDismissed, setLongJobWarningDismissed] = useState(false);
   const [newUserDraft, setNewUserDraft] = useState(null);
   const [editUserTeam, setEditUserTeam] = useState(undefined);
-  const [pinEditConfirmAction, setPinEditConfirmAction] = useState(null); // null | "remove" | "revoke"
+  const [pinEditConfirmAction, setPinEditConfirmAction] = useState(null); // null | "remove" | "revoke" | "rename"
+  const [nameEditValue, setNameEditValue] = useState("");
   const [syncError, setSyncError] = useState(null);
   const [betaActiveJobs, setBetaActiveJobs] = useState([]);
   const [betaJobHistory, setBetaJobHistory] = useState([]);
@@ -913,11 +1036,29 @@ export default function AimflowMasterApp() {
     }
   }, [usersLoading, remoteUsers.length]);
 
+  // ── Seed vehicles to Firestore on first load (from the original hardcoded lists,
+  //    minus the generic "Others" entry which stays as a built-in option, not a managed vehicle) ──
+  useEffect(() => {
+    if (!vehiclesLoading && remoteVehicles.length === 0) {
+      const seedList = [
+        ...TANKER_VEHICLES.filter(v => v !== "Others").map(plate => ({ plate, team: "tanker", active: true })),
+        ...JETTING_VEHICLES.filter(v => v !== "Others").map(plate => ({ plate, team: "jetting", active: true })),
+        ...WATERTANK_VEHICLES.filter(v => v !== "Others").map(plate => ({ plate, team: "watertank", active: true })),
+      ];
+      const batch = writeBatch(db);
+      seedList.forEach(v => batch.set(doc(collection(db, COL.vehicles)), v));
+      batch.commit().catch(e => console.error("Seed vehicles:", e));
+    }
+  }, [vehiclesLoading, remoteVehicles.length]);
+
   const isBeta = session?.role === "beta";
   const myActiveJobsAll = isBeta ? betaActiveJobs : activeJobs;
   const currentJobHistory = isBeta ? betaJobHistory : jobHistory;
   const currentFuelHistory = isBeta ? betaFuelHistory : fuelHistory;
   const myActiveJob = session ? myActiveJobsAll.find(j => j.checker === session.name) || null : null;
+  // Active jobs where I'm listed as crew on SOMEONE ELSE's check-in (not my own active job).
+  // Informational only — does not lock me out of starting my own separate check-in.
+  const myCrewActiveJobs = session ? myActiveJobsAll.filter(j => j.checker !== session.name && (j.crew||[]).includes(session.name)) : [];
   const myLastCompletedJob = session ? [...currentJobHistory].filter(j => j.checker===session.name||(j.crew||[]).includes(session.name)).sort((a,b)=>b.checkOutTime-a.checkOutTime)[0]||null : null;
   const myLastFillUp = session ? [...currentFuelHistory].filter(f=>f.person===session.name).sort((a,b)=>b.date-a.date)[0]||null : null;
   const elapsed = useElapsed(myActiveJob ? myActiveJob.checkInTime : null);
@@ -948,6 +1089,9 @@ export default function AimflowMasterApp() {
     const next = [...new Set([...removedUsers, name])];
     await fsSet(COL.settings, "config", { ...(settingsDoc||{}), removedUsers: next });
   });
+  // Renames a person everywhere: their user record, and every historical job/fuel/filed/leave
+  // record that references their old name. Archives are intentionally left untouched.
+  const renameUser = (oldName, newName) => fsOp(() => fsRenamePerson(oldName, newName));
   const updateSettings = (data) => fsOp(() => fsSet(COL.settings, "config", { ...(settingsDoc||{}), ...data }));
   const setSupervisorTeamPrefs = (prefs) => updateSettings({ supervisorTeamPrefs: prefs });
 
@@ -977,29 +1121,32 @@ export default function AimflowMasterApp() {
   function exportPDF(jobs,fuel){const win=window.open("","_blank");const today=new Date().toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"});const jobRows=jobs.map(j=>`<tr><td>${j.checkInTime?new Date(j.checkInTime).toLocaleDateString("en-SG"):""}</td><td>${teamLabel(j.team)}</td><td>${j.jobSite}</td><td>${j.checker}</td><td>${(j.crew||[]).join(", ")}</td><td>${(j.serviceLines||[]).map(l=>`${l.type}${l.qty?` x${l.qty}`:""}`).join("; ")}</td><td>${j.hours}</td><td>${calcOT(j.checkInTime,j.checkOutTime).toFixed(1)}</td><td>${j.jobsheet||""}</td></tr>`).join("");const fuelRows=fuel.map(f=>`<tr><td>${f.date?new Date(f.date).toLocaleDateString("en-SG"):""}</td><td>${teamLabel(f.team)}</td><td>${f.person}</td><td>${f.vehicle}</td><td>${f.company}</td><td>${f.amount}L</td><td>S$${f.price}</td><td>${f.amount&&f.price?(parseFloat(f.price)/parseFloat(f.amount)).toFixed(3):""}</td></tr>`).join("");win.document.write(`<!DOCTYPE html><html><head><title>Opsflow Export ${today}</title><style>body{font-family:Arial,sans-serif;font-size:10px;padding:16px}h1{font-size:14px}h2{font-size:12px;margin-top:20px}table{width:100%;border-collapse:collapse;margin-top:6px}th,td{border:1px solid #ddd;padding:4px 6px;text-align:left}th{background:#f0f4ff}tr:nth-child(even){background:#fafafa}</style></head><body><h1>Opsflow — Aimflow Pte Ltd</h1><p>Exported: ${today}</p><h2>Jobs (${jobs.length})</h2><table><tr><th>Date</th><th>Team</th><th>Site</th><th>Checker</th><th>Crew</th><th>Services</th><th>Hrs</th><th>OT</th><th>Jobsheet</th></tr>${jobRows}</table><h2>Fuel (${fuel.length})</h2><table><tr><th>Date</th><th>Team</th><th>Person</th><th>Vehicle</th><th>Station</th><th>Amount</th><th>Price</th><th>$/L</th></tr>${fuelRows}</table></body></html>`);win.document.close();win.print();}
 
   // ── Archive / reset ───────────────────────────────────────────────
-  // rangeStart/rangeEnd are "YYYY-MM-DD" strings (inclusive). If omitted, defaults to everything.
-  async function doArchiveReset(pw, rangeStart, rangeEnd, label) {
+  // rangeStart/rangeEnd are "YYYY-MM-DD" strings (inclusive). teamFilter is "tanker"|"jetting"|"watertank"|null (null = all teams).
+  // Both filters are independent and combine: e.g. team=tanker + range=June archives only Tanker's June records.
+  async function doArchiveReset(pw, rangeStart, rangeEnd, teamFilter, label) {
     if (pw!==resetPassword){setArchiveError("Incorrect reset password.");return false;}
     const startTs = rangeStart ? new Date(`${rangeStart}T00:00:00+08:00`).getTime() : -Infinity;
     const endTs = rangeEnd ? new Date(`${rangeEnd}T23:59:59+08:00`).getTime() : Infinity;
     const inRange = (ts) => ts >= startTs && ts <= endTs;
+    const inTeam = (t) => !teamFilter || t === teamFilter;
 
-    const jobsInRange = jobHistory.filter(j => inRange(j.checkInTime));
-    const fuelInRange = fuelHistory.filter(f => inRange(f.date));
-    const filedInRange = filedEntries.filter(e => inRange(e.checkInTime || e.filedAt));
+    const jobsInRange = jobHistory.filter(j => inRange(j.checkInTime) && inTeam(j.team));
+    const fuelInRange = fuelHistory.filter(f => inRange(f.date) && inTeam(f.team));
+    const filedInRange = filedEntries.filter(e => inRange(e.checkInTime || e.filedAt) && inTeam(e.team));
 
     if (jobsInRange.length === 0 && fuelInRange.length === 0 && filedInRange.length === 0) {
-      setArchiveError("No records found in that date range.");
+      setArchiveError("No records found for that team and date range.");
       return false;
     }
 
+    const teamPart = teamFilter ? `${teamLabel(teamFilter)} — ` : "";
     const finalLabel = label || (rangeStart && rangeEnd
-      ? `${new Date(`${rangeStart}T12:00:00+08:00`).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})} – ${new Date(`${rangeEnd}T12:00:00+08:00`).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})}`
-      : new Date().toLocaleDateString("en-SG",{month:"short",year:"numeric"}));
+      ? `${teamPart}${new Date(`${rangeStart}T12:00:00+08:00`).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})} – ${new Date(`${rangeEnd}T12:00:00+08:00`).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})}`
+      : `${teamPart}${new Date().toLocaleDateString("en-SG",{month:"short",year:"numeric"})}`);
 
-    const snapshot={ id:`archive-${Date.now()}`, label:finalLabel, archivedAt:Date.now(), archivedBy:session.name, rangeStart:rangeStart||null, rangeEnd:rangeEnd||null, jobs:jobsInRange, fuel:fuelInRange, filed:filedInRange };
+    const snapshot={ id:`archive-${Date.now()}`, label:finalLabel, archivedAt:Date.now(), archivedBy:session.name, rangeStart:rangeStart||null, rangeEnd:rangeEnd||null, team:teamFilter||null, jobs:jobsInRange, fuel:fuelInRange, filed:filedInRange };
     await fsOp(()=>fsSet(COL.archives,snapshot.id,snapshot));
-    // Only delete the records that were actually archived — anything outside the range stays live.
+    // Only delete the records that were actually archived — anything outside the range/team stays live.
     await fsOp(async () => {
       for (const j of jobsInRange) await fsDelete(COL.jobs, j.id);
       for (const f of fuelInRange) await fsDelete(COL.fuel, f.id);
@@ -1018,6 +1165,23 @@ export default function AimflowMasterApp() {
   // ── Helpers ───────────────────────────────────────────────────────
   function getSupTeams(supName){if(supervisorTeamPrefs[supName])return supervisorTeamPrefs[supName];const u=userDirectory.find(x=>x.name===supName);return u?.supervisorTeams||["tanker","jetting","watertank"];}
   const mySupTeams=session?.role==="supervisor"?getSupTeams(session.name):["tanker","jetting","watertank"];
+
+  // Live vehicle directory, sourced from Firestore once loaded (falls back to the original
+  // hardcoded lists before the first load completes, so check-in screens never show an empty list).
+  // This shadows the module-level `teamVehicles` function for every call site inside this component.
+  function teamVehicles(team) {
+    if (vehiclesLoading || remoteVehicles.length === 0) {
+      if (team === "jetting") return JETTING_VEHICLES;
+      if (team === "watertank") return WATERTANK_VEHICLES;
+      return TANKER_VEHICLES;
+    }
+    const active = remoteVehicles.filter(v => v.team === team && v.active !== false).map(v => v.plate).sort((a,b)=>a.localeCompare(b));
+    return [...active, "Others"];
+  }
+  const addVehicle = (plate, team) => fsOp(() => fsAdd(COL.vehicles, { plate: plate.trim(), team, active: true }));
+  const updateVehicle = (id, data) => fsOp(() => fsUpdate(COL.vehicles, id, data));
+  const removeVehicle = (id) => fsOp(() => fsDelete(COL.vehicles, id)); // hard delete is fine here — vehicle plate strings on past records are just text, not a foreign key into this collection
+
   function checkDuplicate(team,jobSite){if(!jobSite)return false;const today=sgToday();return currentJobHistory.some(j=>{const jDate=j.checkInTime?new Date(j.checkInTime).toLocaleDateString("en-CA",{timeZone:"Asia/Singapore"}):null;return j.team===team&&j.checker===session.name&&jDate===today&&j.jobSite.toLowerCase().trim()===jobSite.toLowerCase().trim();});}
   const isAdminOrSup=session&&(session.role==="admin"||session.role==="supervisor"||session.role==="beta");
   const isTeamLead=session&&(session.role==="admin"||session.role==="supervisor");
@@ -1075,8 +1239,8 @@ export default function AimflowMasterApp() {
             )}
             {(myActiveJob.vehicles?.length > 0 || myActiveJob.crew?.length > 0) && (
               <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:14 }}>
-                {myActiveJob.vehicles?.map((v)=><span key={v} style={pillStyle}>🚛 {v}</span>)}
-                {myActiveJob.crew?.map((name)=><span key={name} style={pillStyle}>👷 {name}</span>)}
+                {myActiveJob.vehicles?.map((v)=><span key={v} style={{ ...pillStyle, display:"inline-flex", alignItems:"center", gap:5 }}><Truck size={11} />{v}</span>)}
+                {myActiveJob.crew?.map((name)=><span key={name} style={{ ...pillStyle, display:"inline-flex", alignItems:"center", gap:5 }}><Users size={11} />{name}</span>)}
               </div>
             )}
             <button onClick={() => setScreen("checkoutGreet")} style={{ width:"100%", background:"#FEF08A", color:"#78350F", border:"none", borderRadius:10, padding:13, fontSize:14.5, fontWeight:800, cursor:"pointer", boxShadow:"0 4px 14px rgba(254,240,138,0.5)", display:"flex", alignItems:"center", justifyContent:"center", gap:7 }}>
@@ -1100,6 +1264,21 @@ export default function AimflowMasterApp() {
             </div>
           );
         })()}
+
+        {/* Informational badge — I'm listed as crew on someone else's currently active job.
+            Read-only: no lock, no checkout access. I can still independently check into a different job. */}
+        {myCrewActiveJobs.length > 0 && myCrewActiveJobs.map((j) => (
+          <div key={j.id} style={{ display:"flex", alignItems:"flex-start", gap:10, border:`1px solid ${BLUE}33`, background:BLUE_LIGHT, borderRadius:13, padding:"12px 14px", marginBottom:14 }}>
+            <Users size={16} color={BLUE_DARK} style={{ flexShrink:0, marginTop:1 }} />
+            <div>
+              <div style={{ fontSize:12.5, fontWeight:700, color:BLUE_DARK, marginBottom:2 }}>You're marked on an active job</div>
+              <div style={{ fontSize:12, color:"#374151" }}>{j.jobSite || "Site not recorded"} · checked in by {j.checker}</div>
+            </div>
+          </div>
+        ))}
+
+        {/* Last fill-up status card — workers only */}
+        {isWorker && <FuelStatusCard lastFillUp={myLastFillUp} />}
 
         {/* Last completed job card (workers only, when no active job) */}
         {!myActiveJob && myLastCompletedJob && isWorker && (
@@ -1125,7 +1304,7 @@ export default function AimflowMasterApp() {
             {myLastCompletedJob.crew?.length > 0 && (
               <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
                 {myLastCompletedJob.crew.map((name) => (
-                  <span key={name} style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:6, background:"rgba(255,255,255,0.15)" }}>👷 {name}</span>
+                  <span key={name} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:6, background:"rgba(255,255,255,0.15)" }}><Users size={10} />{name}</span>
                 ))}
               </div>
             )}
@@ -1326,6 +1505,10 @@ export default function AimflowMasterApp() {
           <span style={{ ...tileIconStyle, background:PURPLE_LIGHT }}><Users size={22} color={PURPLE} /></span>
           <span style={{ flex:1 }}><span style={tileTitleStyle}>Manage users & PINs</span><span style={tileSubStyle}>{isAdmin ? "Add users, reset PINs, revoke access" : "View and edit worker PINs"}</span></span>
         </button>
+        <button onClick={()=>{setVehicleEditTarget(null);setNewVehiclePlate("");setNewVehicleTeam((isAdmin?["tanker","jetting","watertank"]:mySupTeams)[0]);setScreen("adminVehicles");}} style={tileStyle()}>
+          <span style={{ ...tileIconStyle, background:BLUE_LIGHT }}><Truck size={22} color={BLUE} /></span>
+          <span style={{ flex:1 }}><span style={tileTitleStyle}>Manage vehicles</span><span style={tileSubStyle}>Add, edit, remove vehicles per team</span></span>
+        </button>
         {isAdmin && (
           <button onClick={()=>setScreen("adminSupervisors")} style={tileStyle()}>
             <span style={{ ...tileIconStyle, background:BLUE_LIGHT }}><Users size={22} color={BLUE} /></span>
@@ -1336,9 +1519,9 @@ export default function AimflowMasterApp() {
           <span style={{ ...tileIconStyle, background:RED_LIGHT }}><AlertTriangle size={22} color={RED} /></span>
           <span style={{ flex:1 }}><span style={tileTitleStyle}>Data management</span><span style={tileSubStyle}>Delete live logs — code required</span></span>
         </button>
-        <button onClick={()=>{setArchivePassword("");setArchiveError(null);setArchiveSuccess(null);setScreen("archiveTools");}} style={tileStyle()}>
+        <button onClick={()=>{setArchivePassword("");setArchiveError(null);setArchiveSuccess(null);setArchiveTeamFilter(null);setArchiveRangeMode("all");setScreen("archiveTools");}} style={tileStyle()}>
           <span style={{ ...tileIconStyle, background:GREEN_LIGHT }}><Archive size={22} color={GREEN_DARK} /></span>
-          <span style={{ flex:1 }}><span style={tileTitleStyle}>Monthly archive & reset</span><span style={tileSubStyle}>Download, reset and restore data</span></span>
+          <span style={{ flex:1 }}><span style={tileTitleStyle}>Archive & reset</span><span style={tileSubStyle}>By team and date range — download, reset, restore</span></span>
         </button>
         {isAdmin && (
           <button onClick={()=>{setNewResetPw("");setScreen("resetPwSettings");}} style={tileStyle()}>
@@ -1385,19 +1568,24 @@ export default function AimflowMasterApp() {
 
   // ── Archive tools ────────────────────────────────────────────────
   if (screen === "archiveTools") {
-    const totalJobs = jobHistory.length;
-    const totalFuel = fuelHistory.length;
+    const isAdmin = session.role === "admin";
+    // Supervisors can only archive/reset their own assigned team(s); admin can pick any team or all teams.
+    const availableTeams = isAdmin ? ["tanker","jetting","watertank"] : mySupTeams;
+    const teamFilter = archiveTeamFilter; // null = all available teams
+    const effectiveTeams = teamFilter ? [teamFilter] : availableTeams;
 
-    // Range selection: "all" (everything live) or "custom" (pick dates)
+    const totalJobs = jobHistory.filter(j => effectiveTeams.includes(j.team)).length;
+    const totalFuel = fuelHistory.filter(f => effectiveTeams.includes(f.team)).length;
+
     const rangeMode = archiveRangeMode;
     const startTs = archiveRangeStart ? new Date(`${archiveRangeStart}T00:00:00+08:00`).getTime() : -Infinity;
     const endTs = archiveRangeEnd ? new Date(`${archiveRangeEnd}T23:59:59+08:00`).getTime() : Infinity;
     const inRange = (ts) => ts >= startTs && ts <= endTs;
-    const previewJobs = rangeMode === "custom" ? jobHistory.filter(j => inRange(j.checkInTime)) : jobHistory;
-    const previewFuel = rangeMode === "custom" ? fuelHistory.filter(f => inRange(f.date)) : fuelHistory;
+    const inScope = (team) => effectiveTeams.includes(team);
+    const previewJobs = (rangeMode === "custom" ? jobHistory.filter(j => inRange(j.checkInTime)) : jobHistory).filter(j => inScope(j.team));
+    const previewFuel = (rangeMode === "custom" ? fuelHistory.filter(f => inRange(f.date)) : fuelHistory).filter(f => inScope(f.team));
     const rangeValid = rangeMode === "all" || (archiveRangeStart && archiveRangeEnd && archiveRangeStart <= archiveRangeEnd);
 
-    // Quick presets
     const setThisMonth = () => {
       const now = new Date();
       const first = new Date(now.getFullYear(), now.getMonth(), 1).toLocaleDateString("en-CA");
@@ -1411,39 +1599,55 @@ export default function AimflowMasterApp() {
       setArchiveRangeStart(first); setArchiveRangeEnd(last);
     };
 
+    const scopeLabel = teamFilter ? teamLabel(teamFilter) : (isAdmin ? "All teams" : availableTeams.map(teamLabel).join(" + "));
+
     return (
       <Shell>
-        <Header title="Monthly archive & reset" onBack={()=>setScreen("adminTools")} accent={GREEN_DARK} />
+        <Header title="Archive & reset" onBack={()=>setScreen("adminTools")} accent={GREEN_DARK} />
 
         {showArchiveConfirm && (
           <ConfirmModal
-            title="Archive and reset this data?"
-            body={`This will save a snapshot of ${previewJobs.length} job record${previewJobs.length===1?"":"s"} and ${previewFuel.length} fuel record${previewFuel.length===1?"":"s"}, then permanently remove them from the live app. Make sure you've downloaded the CSV/PDF first if you need a copy outside Opsflow.`}
+            title={`Archive ${scopeLabel}?`}
+            body={`This saves a snapshot of ${previewJobs.length} job record${previewJobs.length===1?"":"s"} and ${previewFuel.length} fuel record${previewFuel.length===1?"":"s"} for ${scopeLabel}, then permanently removes them from the live app. Other teams' data is not affected. Download a CSV/PDF copy first if you need one outside Opsflow.`}
             confirmLabel="Archive & reset"
             confirmColor={GREEN_DARK}
             icon={Archive}
             onCancel={()=>setShowArchiveConfirm(false)}
             onConfirm={async()=>{
               setShowArchiveConfirm(false);
-              await doArchiveReset(archivePassword, rangeMode==="custom"?archiveRangeStart:null, rangeMode==="custom"?archiveRangeEnd:null);
+              await doArchiveReset(archivePassword, rangeMode==="custom"?archiveRangeStart:null, rangeMode==="custom"?archiveRangeEnd:null, teamFilter);
             }}
           />
         )}
 
-        <div style={{ display:"flex", gap:8, background:GREEN_LIGHT, borderRadius:12, padding:"11px 13px", marginBottom:18, fontSize:12, color:GREEN_DARK }}>
-          <Archive size={16} style={{ flexShrink:0, marginTop:1 }} />
-          <span>Archive saves a snapshot of the selected data, then removes it from the live app. Data can be restored at any time. Only records within your chosen range are affected — everything else stays live.</span>
+        {/* Step 1 — Team scope */}
+        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>1 · Team</div>
+        <div style={{ display:"flex", flexDirection:"column", gap:8, marginBottom:20 }}>
+          {isAdmin && (
+            <button onClick={()=>setArchiveTeamFilter(null)} style={{ display:"flex", alignItems:"center", gap:10, padding:"13px 14px", borderRadius:12, border: teamFilter===null?`1.5px solid ${GREEN_DARK}`:`1px solid ${BORDER}`, background: teamFilter===null?GREEN_LIGHT:"white", textAlign:"left", cursor:"pointer" }}>
+              <Building2 size={17} color={teamFilter===null?GREEN_DARK:SLATE} />
+              <span style={{ flex:1, fontSize:13.5, fontWeight:600, color:teamFilter===null?GREEN_DARK:INK }}>All teams</span>
+              {teamFilter===null && <Check size={15} color={GREEN_DARK} strokeWidth={3} />}
+            </button>
+          )}
+          {availableTeams.map((t) => {
+            const accent = teamAccent(t);
+            const isSel = teamFilter === t;
+            return (
+              <button key={t} onClick={()=>setArchiveTeamFilter(t)} style={{ display:"flex", alignItems:"center", gap:10, padding:"13px 14px", borderRadius:12, border: isSel?`1.5px solid ${accent}`:`1px solid ${BORDER}`, background: isSel?`${accent}10`:"white", textAlign:"left", cursor:"pointer" }}>
+                <TeamIcon team={t} size={17} color={isSel?accent:SLATE} />
+                <span style={{ flex:1, fontSize:13.5, fontWeight:600, color:isSel?accent:INK }}>{teamLabel(t)}</span>
+                {isSel && <Check size={15} color={accent} strokeWidth={3} />}
+              </button>
+            );
+          })}
         </div>
 
-        <div style={{ border:`1px solid ${BORDER}`, borderRadius:13, padding:"14px", marginBottom:16, background:"white" }}>
-          <div style={{ fontSize:12, color:SLATE, marginBottom:4 }}>Current live data (all time)</div>
-          <div style={{ fontSize:15, fontWeight:700, color:INK }}>{totalJobs} job records · {totalFuel} fuel records</div>
-        </div>
-
-        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>What to archive</div>
+        {/* Step 2 — Date scope */}
+        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>2 · Date range</div>
         <div style={{ display:"flex", gap:8, marginBottom:14 }}>
           <button onClick={()=>setArchiveRangeMode("all")} style={{ flex:1, padding:"11px 8px", borderRadius:11, border: rangeMode==="all"?`1.5px solid ${GREEN_DARK}`:`1px solid ${BORDER}`, background: rangeMode==="all"?GREEN_LIGHT:"white", color: rangeMode==="all"?GREEN_DARK:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Everything live</button>
-          <button onClick={()=>setArchiveRangeMode("custom")} style={{ flex:1, padding:"11px 8px", borderRadius:11, border: rangeMode==="custom"?`1.5px solid ${GREEN_DARK}`:`1px solid ${BORDER}`, background: rangeMode==="custom"?GREEN_LIGHT:"white", color: rangeMode==="custom"?GREEN_DARK:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Custom date range</button>
+          <button onClick={()=>setArchiveRangeMode("custom")} style={{ flex:1, padding:"11px 8px", borderRadius:11, border: rangeMode==="custom"?`1.5px solid ${GREEN_DARK}`:`1px solid ${BORDER}`, background: rangeMode==="custom"?GREEN_LIGHT:"white", color: rangeMode==="custom"?GREEN_DARK:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Custom range</button>
         </div>
 
         {rangeMode === "custom" && (
@@ -1456,16 +1660,19 @@ export default function AimflowMasterApp() {
               <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>From</div><input type="date" value={archiveRangeStart} onChange={(e)=>setArchiveRangeStart(e.target.value)} style={{ ...inputStyle, marginBottom:0 }} /></div>
               <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>To</div><input type="date" value={archiveRangeEnd} min={archiveRangeStart} onChange={(e)=>setArchiveRangeEnd(e.target.value)} style={{ ...inputStyle, marginBottom:0 }} /></div>
             </div>
-            {rangeValid && (
-              <div style={{ background:BLUE_LIGHT, borderRadius:10, padding:"9px 13px", marginBottom:14, fontSize:12, color:BLUE_DARK, fontWeight:600 }}>
-                {previewJobs.length} job{previewJobs.length===1?"":"s"} and {previewFuel.length} fuel record{previewFuel.length===1?"":"s"} fall within this range
-              </div>
-            )}
           </>
         )}
 
-        <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Reset password</div>
-        <input type="password" value={archivePassword} onChange={(e)=>{setArchivePassword(e.target.value);setArchiveError(null);}} placeholder="Enter reset password" style={inputStyle} />
+        {/* Live preview of what will be archived */}
+        <div style={{ border:`1.5px solid ${GREEN_DARK}33`, background:GREEN_LIGHT, borderRadius:13, padding:"13px 14px", marginBottom:20 }}>
+          <div style={{ fontSize:10.5, fontWeight:700, color:GREEN_DARK, textTransform:"uppercase", letterSpacing:0.4, marginBottom:4 }}>Will archive</div>
+          <div style={{ fontSize:15, fontWeight:700, color:INK }}>{scopeLabel}</div>
+          <div style={{ fontSize:12.5, color:"#374151", marginTop:2 }}>{previewJobs.length} job{previewJobs.length===1?"":"s"} · {previewFuel.length} fuel record{previewFuel.length===1?"":"s"}</div>
+        </div>
+
+        {/* Step 3 — Confirm with password */}
+        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>3 · Confirm</div>
+        <input type="password" value={archivePassword} onChange={(e)=>{setArchivePassword(e.target.value);setArchiveError(null);}} placeholder="Reset password" style={inputStyle} />
         {archiveError && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={15} style={{ flexShrink:0 }} /><span>{archiveError}</span></div>}
         {archiveSuccess && <div style={{ display:"flex", gap:8, background:GREEN_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:GREEN_DARK }}><CheckCircle2 size={15} style={{ flexShrink:0 }} /><span>{archiveSuccess}</span></div>}
 
@@ -1475,17 +1682,22 @@ export default function AimflowMasterApp() {
           <button onClick={()=>exportPDF(previewJobs,previewFuel)} style={{ flex:1, padding:12, borderRadius:12, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:13, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Download size={14} /> PDF</button>
         </div>
 
-        <PrimaryButton accent={GREEN_DARK} disabled={!archivePassword.trim() || !rangeValid} onClick={()=>setShowArchiveConfirm(true)}>
-          <Archive size={16} /> Archive & Reset
+        <PrimaryButton accent={GREEN_DARK} disabled={!archivePassword.trim() || !rangeValid || previewJobs.length+previewFuel.length===0} onClick={()=>setShowArchiveConfirm(true)}>
+          <Archive size={16} /> Archive & Reset {scopeLabel}
         </PrimaryButton>
 
         {archives.length > 0 && (
           <>
-            <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"18px 0 8px", textTransform:"uppercase", letterSpacing:0.5 }}>Past archives</div>
-            {archives.map((arc) => (
+            <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"20px 0 8px", textTransform:"uppercase", letterSpacing:0.5 }}>Past archives</div>
+            {archives
+              .filter(arc => isAdmin || !arc.team || availableTeams.includes(arc.team))
+              .map((arc) => (
               <div key={arc.id} style={{ border:`1px solid ${BORDER}`, borderRadius:13, padding:"13px 14px", marginBottom:10, background:"white" }}>
                 <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 }}>
-                  <div style={{ fontSize:14, fontWeight:700, color:INK }}>{arc.label}</div>
+                  <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+                    {arc.team && <TeamIcon team={arc.team} size={14} color={teamAccent(arc.team)} />}
+                    <div style={{ fontSize:14, fontWeight:700, color:INK }}>{arc.label}</div>
+                  </div>
                   <div style={{ fontSize:11, color:SLATE_LIGHT }}>{new Date(arc.archivedAt).toLocaleDateString("en-SG")}</div>
                 </div>
                 <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>{arc.jobs.length} jobs · {arc.fuel.length} fuel records · archived by {arc.archivedBy}</div>
@@ -1584,7 +1796,7 @@ export default function AimflowMasterApp() {
           <div style={{ padding:"12px 0" }}>
             <div style={{ display:"flex", gap:8, background:PURPLE_LIGHT, borderRadius:11, padding:"10px 12px", marginBottom:16, fontSize:12, color:PURPLE }}><ShieldAlert size={15} style={{ flexShrink:0, marginTop:1 }} /><span>Beta mode — set a manual check-in time to simulate OT scenarios.</span></div>
             <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Simulated check-in date & time</div>
-            <input type="datetime-local" value={draft.manualCheckIn} onChange={(e)=>setDraft({...draft,manualCheckIn:e.target.value,gpsCaptured:!!e.target.value})} style={{ ...inputStyle, marginBottom:18 }} />
+            <input type="datetime-local" value={draft.manualCheckIn} onChange={(e)=>setDraft({...draft,manualCheckIn:e.target.value,gpsCaptured:!!e.target.value})} style={{ ...datetimeInputStyle, marginBottom:18 }} />
             <PrimaryButton accent={PURPLE} disabled={!draft.manualCheckIn} onClick={()=>setScreen("checkinVehicle")}>Continue</PrimaryButton>
           </div>
         ) : (
@@ -1692,6 +1904,15 @@ export default function AimflowMasterApp() {
                         return <button key={name} onClick={()=>toggleCrewMember(v,name)} style={{ padding:"7px 12px", borderRadius:8, border:isPicked?`1.5px solid ${accent}`:`1px solid ${BORDER}`, background:isPicked?accent:"white", color:isPicked?"white":"#374151", fontSize:12.5, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", gap:5 }}>{isPicked && <Check size={11} strokeWidth={3} />}{name}</button>
                       })}
                     </div>
+                    {teamWorkerOptions(draft.team,userDirectory).supervisors.length>0 && <>
+                      <div style={{ fontSize:10, color:SLATE_LIGHT, fontWeight:700, textTransform:"uppercase", letterSpacing:0.3, marginBottom:5 }}>Supervisors</div>
+                      <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:10 }}>
+                        {teamWorkerOptions(draft.team,userDirectory).supervisors.map((name)=>{
+                          const isPicked=crewHere.includes(name);
+                          return <button key={name} onClick={()=>toggleCrewMember(v,name)} style={{ padding:"7px 12px", borderRadius:8, border:isPicked?`1.5px solid ${AMBER_DARK}`:`1px solid ${BORDER}`, background:isPicked?AMBER_DARK:"white", color:isPicked?"white":"#374151", fontSize:12.5, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", gap:5 }}>{isPicked && <Check size={11} strokeWidth={3} />}{name}</button>
+                        })}
+                      </div>
+                    </>}
                     {teamWorkerOptions(draft.team,userDirectory).other.length>0 && <>
                       <div style={{ fontSize:10, color:SLATE_LIGHT, fontWeight:700, textTransform:"uppercase", letterSpacing:0.3, marginBottom:5 }}>Helping from another team</div>
                       <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:10 }}>
@@ -1878,7 +2099,7 @@ export default function AimflowMasterApp() {
         {!isJetting && <><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>PUB disposal number</div><input value={checkoutDraft.pubDisposal} onChange={(e)=>setCheckoutDraft({...checkoutDraft,pubDisposal:e.target.value})} placeholder="e.g. PD-2024-0087" style={inputStyle} /></>}
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Remarks (optional)</div>
         <input value={checkoutDraft.remarks} onChange={(e)=>setCheckoutDraft({...checkoutDraft,remarks:e.target.value})} placeholder="Any notes for the supervisor" style={{ ...inputStyle, marginBottom:18 }} />
-        {isBeta && <><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Simulated check-out time</div><input type="datetime-local" value={checkoutDraft.manualCheckOut} onChange={(e)=>setCheckoutDraft({...checkoutDraft,manualCheckOut:e.target.value})} style={inputStyle} /></>}
+        {isBeta && <><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Simulated check-out time</div><input type="datetime-local" value={checkoutDraft.manualCheckOut} onChange={(e)=>setCheckoutDraft({...checkoutDraft,manualCheckOut:e.target.value})} style={datetimeInputStyle} /></>}
         <PrimaryButton accent={accent} disabled={!valid} onClick={()=>setScreen("checkoutReview")}>Review & confirm</PrimaryButton>
       </Shell>
     );
@@ -1957,7 +2178,7 @@ export default function AimflowMasterApp() {
                 <div style={{ fontSize:10, fontWeight:700, color:SLATE_LIGHT, textTransform:"uppercase", letterSpacing:0.3, marginBottom:6 }}>Personnel</div>
                 <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
                   {lastJob.crew.map((name)=>(
-                    <span key={name} style={{ fontSize:12, fontWeight:600, padding:"4px 10px", borderRadius:7, background:BLUE_LIGHT, color:BLUE_DARK }}>👷 {name}</span>
+                    <span key={name} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:12, fontWeight:600, padding:"4px 10px", borderRadius:7, background:BLUE_LIGHT, color:BLUE_DARK }}><Users size={11} />{name}</span>
                   ))}
                 </div>
               </div>
@@ -1994,9 +2215,9 @@ export default function AimflowMasterApp() {
           <span>No GPS for filed entries — enter the actual date and time you were on site. This will be reviewed before it counts toward your hours.</span>
         </div>
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Check-in date & time</div>
-        <input type="datetime-local" value={filedDraft.manualCheckIn} onChange={(e)=>setFiledDraft({...filedDraft,manualCheckIn:e.target.value})} style={inputStyle} />
+        <input type="datetime-local" value={filedDraft.manualCheckIn} onChange={(e)=>setFiledDraft({...filedDraft,manualCheckIn:e.target.value})} style={datetimeInputStyle} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Check-out date & time</div>
-        <input type="datetime-local" value={filedDraft.manualCheckOut} onChange={(e)=>setFiledDraft({...filedDraft,manualCheckOut:e.target.value})} style={{ ...inputStyle, marginBottom:18 }} />
+        <input type="datetime-local" value={filedDraft.manualCheckOut} onChange={(e)=>setFiledDraft({...filedDraft,manualCheckOut:e.target.value})} style={{ ...datetimeInputStyle, marginBottom:18 }} />
         <PrimaryButton accent="#C2570C" disabled={!valid} onClick={()=>setScreen("filedVehicle")}>Continue</PrimaryButton>
       </Shell>
     );
@@ -2034,6 +2255,12 @@ export default function AimflowMasterApp() {
                     <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:10 }}>
                       {teamWorkerOptions(filedDraft.team,userDirectory).own.map((name)=>{ const isPicked=crewHere.includes(name); return <button key={name} onClick={()=>toggleCrewMember(v,name)} style={{ padding:"7px 12px", borderRadius:8, border:isPicked?`1.5px solid ${accent}`:`1px solid ${BORDER}`, background:isPicked?accent:"white", color:isPicked?"white":"#374151", fontSize:12.5, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", gap:5 }}>{isPicked&&<Check size={11} strokeWidth={3} />}{name}</button>; })}
                     </div>
+                    {teamWorkerOptions(filedDraft.team,userDirectory).supervisors.length>0 && <>
+                      <div style={{ fontSize:10, color:SLATE_LIGHT, fontWeight:700, textTransform:"uppercase", letterSpacing:0.3, marginBottom:5 }}>Supervisors</div>
+                      <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:10 }}>
+                        {teamWorkerOptions(filedDraft.team,userDirectory).supervisors.map((name)=>{ const isPicked=crewHere.includes(name); return <button key={name} onClick={()=>toggleCrewMember(v,name)} style={{ padding:"7px 12px", borderRadius:8, border:isPicked?`1.5px solid ${AMBER_DARK}`:`1px solid ${BORDER}`, background:isPicked?AMBER_DARK:"white", color:isPicked?"white":"#374151", fontSize:12.5, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", gap:5 }}>{isPicked&&<Check size={11} strokeWidth={3} />}{name}</button>; })}
+                      </div>
+                    </>}
                     {teamWorkerOptions(filedDraft.team,userDirectory).other.length>0 && <>
                       <div style={{ fontSize:10, color:SLATE_LIGHT, fontWeight:700, textTransform:"uppercase", letterSpacing:0.3, marginBottom:5 }}>Other teams / helpers</div>
                       <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:10 }}>
@@ -2603,7 +2830,7 @@ export default function AimflowMasterApp() {
                 {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
                 {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
               </div>
-              {j.vehicles?.length>0 && <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:8 }}>{j.vehicles.map((v)=><span key={v} style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>🚛 {v}</span>)}</div>}
+              {j.vehicles?.length>0 && <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:8 }}>{j.vehicles.map((v)=><span key={v} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}><Truck size={11} color="#6B7280" />{v}</span>)}</div>}
               <div style={{ fontSize:10.5, fontWeight:700, color:SLATE, marginBottom:6, textTransform:"uppercase", letterSpacing:0.3 }}>Hours per person</div>
               {allPeople.map((person)=>{
                 const otVisible=canSeeOT(session,person);
@@ -2633,6 +2860,7 @@ export default function AimflowMasterApp() {
 
   // ── Personnel log ─────────────────────────────────────────────────
   if (screen === "personnelLog") {
+    const isWorker = session.role === "worker";
     const canPickAnyone = isAdminOrSup;
     const pickableNames = canPickAnyone
       ? userDirectory.filter((u)=>u.role==="worker"||u.role==="supervisor").map((u)=>u.name).sort((a,b)=>a.localeCompare(b))
@@ -2827,9 +3055,9 @@ export default function AimflowMasterApp() {
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Job site</div>
         <input value={editDraft.jobSite} onChange={(e)=>setEditDraft({...editDraft,jobSite:e.target.value})} style={inputStyle} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Check-in date & time</div>
-        <input type="datetime-local" value={editDraft.manualCheckIn} onChange={(e)=>setEditDraft({...editDraft,manualCheckIn:e.target.value})} style={inputStyle} />
+        <input type="datetime-local" value={editDraft.manualCheckIn} onChange={(e)=>setEditDraft({...editDraft,manualCheckIn:e.target.value})} style={datetimeInputStyle} />
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Check-out date & time</div>
-        <input type="datetime-local" value={editDraft.manualCheckOut} onChange={(e)=>setEditDraft({...editDraft,manualCheckOut:e.target.value})} style={{ ...inputStyle, marginBottom:18 }} />
+        <input type="datetime-local" value={editDraft.manualCheckOut} onChange={(e)=>setEditDraft({...editDraft,manualCheckOut:e.target.value})} style={{ ...datetimeInputStyle, marginBottom:18 }} />
         {validTimes ? (
           <div style={{ border:`1px solid ${BORDER}`, borderRadius:12, padding:14, marginBottom:18, background:"white" }}>
             <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.4 }}>Recalculated live</div>
@@ -2909,6 +3137,8 @@ export default function AimflowMasterApp() {
 
   // ── Admin data tools ─────────────────────────────────────────────
   if (screen === "adminDataTools" && isTeamLead) {
+    const isAdmin = session.role === "admin";
+    const availableTeams = isAdmin ? ["tanker","jetting","watertank"] : mySupTeams;
     const teamCounts=(t)=>({ jobs:jobHistory.filter((j)=>j.team===t).length, fuel:fuelHistory.filter((f)=>f.team===t).length });
     const goDelete=(target)=>{setDeleteTarget(target);setDeleteCode("");setDeleteError(null);setScreen("deleteConfirm");};
     const selectedCounts=dataToolsTeam?teamCounts(dataToolsTeam):null;
@@ -2923,7 +3153,7 @@ export default function AimflowMasterApp() {
         <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Select a team</div>
         <select value={dataToolsTeam||""} onChange={(e)=>setDataToolsTeam(e.target.value||null)} style={{ ...inputStyle, marginBottom:dataToolsTeam?18:24, cursor:"pointer" }}>
           <option value="">Choose a team…</option>
-          {["tanker","jetting","watertank"].map((t)=>{ const c=teamCounts(t); return <option key={t} value={t}>{teamLabel(t)} team — {c.jobs} jobs, {c.fuel} fuel</option>; })}
+          {availableTeams.map((t)=>{ const c=teamCounts(t); return <option key={t} value={t}>{teamLabel(t)} team — {c.jobs} jobs, {c.fuel} fuel</option>; })}
         </select>
         {dataToolsTeam && (
           <div style={{ marginBottom:24 }}>
@@ -2933,9 +3163,13 @@ export default function AimflowMasterApp() {
             <button onClick={()=>!allEmpty&&goDelete(dataToolsTeam)} disabled={allEmpty} style={{ ...rowBtnStyle(allEmpty), background:allEmpty?"white":RED_LIGHT, marginBottom:0 }}><span style={{ fontSize:13.5, fontWeight:700, color:RED }}>All {teamLabel(dataToolsTeam)} logs</span><AlertTriangle size={14} color={RED} /></button>
           </div>
         )}
-        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Delete everything</div>
-        <button onClick={()=>goDelete("all_live")} style={{ width:"100%", padding:14, borderRadius:12, border:`1.5px solid ${RED}`, background:"white", color:RED, fontSize:13.5, fontWeight:700, cursor:"pointer", marginBottom:8, display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}><AlertTriangle size={16} /> Delete ALL live logs (all teams)</button>
-        <button onClick={()=>goDelete("everything")} style={{ width:"100%", padding:14, borderRadius:12, border:"none", background:RED, color:"white", fontSize:13.5, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}><AlertTriangle size={16} /> Delete EVERYTHING — live + beta</button>
+        {isAdmin && (
+          <>
+            <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Delete everything (admin only)</div>
+            <button onClick={()=>goDelete("all_live")} style={{ width:"100%", padding:14, borderRadius:12, border:`1.5px solid ${RED}`, background:"white", color:RED, fontSize:13.5, fontWeight:700, cursor:"pointer", marginBottom:8, display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}><AlertTriangle size={16} /> Delete ALL live logs (all teams)</button>
+            <button onClick={()=>goDelete("everything")} style={{ width:"100%", padding:14, borderRadius:12, border:"none", background:RED, color:"white", fontSize:13.5, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}><AlertTriangle size={16} /> Delete EVERYTHING — live + beta</button>
+          </>
+        )}
       </Shell>
     );
   }
@@ -3013,7 +3247,7 @@ export default function AimflowMasterApp() {
                   </div>
                 </div>
                 {canEditUser(u) ? (
-                  <button onClick={()=>{setPinEditTarget(u.name);setPinEditValue(u.pin.startsWith("REVOKED")?"":u.pin);setPinEditConfirmAction(null);setScreen("adminPinEdit");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:9, padding:"7px 12px", fontSize:12, fontWeight:600, color:PURPLE, cursor:"pointer" }}>Edit</button>
+                  <button onClick={()=>{setPinEditTarget(u.name);setPinEditValue(u.pin.startsWith("REVOKED")?"":u.pin);setPinEditConfirmAction(null);setNameEditValue(u.name);setScreen("adminPinEdit");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:9, padding:"9px 16px", minHeight:38, fontSize:12, fontWeight:600, color:PURPLE, cursor:"pointer" }}>Edit</button>
                 ) : (
                   <span style={{ fontSize:11, color:SLATE_LIGHT, padding:"7px 12px" }}>—</span>
                 )}
@@ -3136,6 +3370,22 @@ export default function AimflowMasterApp() {
       <Shell>
         <Header title={`Edit — ${pinEditTarget}`} onBack={()=>setScreen("adminUsers")} accent={PURPLE} />
 
+        {pinEditConfirmAction === "rename" && (
+          <ConfirmModal
+            title={`Rename ${target?.name} to "${nameEditValue.trim()}"?`}
+            body="This updates their name everywhere — job logs, fuel logs, filed entries, leave board, and team assignments. Their PIN and history stay the same, only the name changes. This does not affect past archived snapshots."
+            confirmLabel="Rename"
+            confirmColor={PURPLE}
+            icon={Pencil}
+            onCancel={()=>setPinEditConfirmAction(null)}
+            onConfirm={()=>{
+              renameUser(pinEditTarget, nameEditValue.trim());
+              setPinEditTarget(nameEditValue.trim());
+              setPinEditConfirmAction(null);
+              setScreen("adminUsers");
+            }}
+          />
+        )}
         {pinEditConfirmAction === "remove" && (
           <ConfirmModal
             title={`Remove ${target?.name}?`}
@@ -3166,6 +3416,27 @@ export default function AimflowMasterApp() {
             {target?.role === "worker" ? `${teamLabel(target.team)} team` : target?.role === "supervisor" ? "Supervisor" : "Admin"}
           </div>
         </div>
+
+        {/* Name edit */}
+        {(() => {
+          const trimmed = nameEditValue.trim();
+          const nameChanged = trimmed && trimmed !== target?.name;
+          const nameDuplicate = nameChanged && userDirectory.some((u) => u.name.toLowerCase() === trimmed.toLowerCase());
+          const isSelf = target?.name === session.name;
+          return (
+            <>
+              <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Name</div>
+              <input value={nameEditValue || target?.name || ""} onChange={(e)=>setNameEditValue(e.target.value)} placeholder="Full name" disabled={isSelf} style={{ ...inputStyle, ...(isSelf ? { background:CANVAS, color:SLATE_LIGHT } : {}) }} />
+              {isSelf && <div style={{ fontSize:11, color:SLATE_LIGHT, marginTop:-10, marginBottom:14 }}>You can't rename your own account while logged in — ask another admin, or log out and back in after they rename you.</div>}
+              {nameDuplicate && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={16} style={{ flexShrink:0, marginTop:1 }} /><span>Another user already has this name.</span></div>}
+              {nameChanged && !nameDuplicate && !isSelf && (
+                <button onClick={()=>setPinEditConfirmAction("rename")} style={{ width:"100%", padding:13, borderRadius:12, border:"none", background:PURPLE, color:"white", fontSize:14, fontWeight:700, cursor:"pointer", marginBottom:18, display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
+                  <Pencil size={15} /> Rename to "{trimmed}"
+                </button>
+              )}
+            </>
+          );
+        })()}
 
         {/* Role/team edit — admin only */}
         {isAdmin && target?.role === "worker" && (
@@ -3214,6 +3485,92 @@ export default function AimflowMasterApp() {
     );
   }
 
+  // ── Vehicle management ────────────────────────────────────────────
+  if (screen === "adminVehicles" && isTeamLead) {
+    const isAdmin = session.role === "admin";
+    const availableTeams = isAdmin ? ["tanker","jetting","watertank"] : mySupTeams;
+    const isEditing = !!vehicleEditTarget;
+    const plateTrimmed = newVehiclePlate.trim();
+    const allActivePlates = remoteVehicles.filter(v => v.active !== false).map(v => v.plate.toLowerCase());
+    const isDuplicate = plateTrimmed && allActivePlates.includes(plateTrimmed.toLowerCase()) && (!isEditing || vehicleEditTarget.plate.toLowerCase() !== plateTrimmed.toLowerCase());
+    const canSave = plateTrimmed.length > 0 && !isDuplicate && availableTeams.includes(newVehicleTeam);
+
+    return (
+      <Shell>
+        <Header title="Manage vehicles" onBack={()=>setScreen("adminTools")} accent={BLUE} />
+
+        {vehicleDeleteTarget && (
+          <ConfirmModal
+            title={`Remove ${vehicleDeleteTarget.plate}?`}
+            body="This removes the vehicle from the check-in and fuel fill-up pickers going forward. Past job and fuel records that reference this vehicle are not affected — the plate number stays in their history."
+            confirmLabel="Remove vehicle"
+            onCancel={()=>setVehicleDeleteTarget(null)}
+            onConfirm={()=>{ removeVehicle(vehicleDeleteTarget.id); setVehicleDeleteTarget(null); }}
+          />
+        )}
+
+        {/* Add / Edit form */}
+        <div style={{ border:`1px solid ${BORDER}`, borderRadius:14, padding:"16px", marginBottom:20, background:"white" }}>
+          <div style={{ fontSize:12.5, fontWeight:700, color:INK, marginBottom:12 }}>{isEditing ? `Editing ${vehicleEditTarget.plate}` : "Add a vehicle"}</div>
+          <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Plate / vehicle name</div>
+          <input value={newVehiclePlate} onChange={(e)=>setNewVehiclePlate(e.target.value)} placeholder="e.g. Small Tanker GBJ5093Y" style={inputStyle} />
+          {isDuplicate && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={15} style={{ flexShrink:0 }} /><span>A vehicle with this name already exists.</span></div>}
+          <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>Team</div>
+          <div style={{ display:"flex", gap:8, marginBottom:16 }}>
+            {availableTeams.map((t) => {
+              const accent = teamAccent(t);
+              const isSel = newVehicleTeam === t;
+              return (
+                <button key={t} onClick={()=>setNewVehicleTeam(t)} style={{ flex:1, padding:"10px 6px", borderRadius:10, border: isSel?`1.5px solid ${accent}`:`1px solid ${BORDER}`, background: isSel?`${accent}12`:"white", color: isSel?accent:SLATE, fontSize:12, fontWeight:600, cursor:"pointer" }}>
+                  {teamLabel(t)}
+                </button>
+              );
+            })}
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            {isEditing && (
+              <button onClick={()=>{setVehicleEditTarget(null);setNewVehiclePlate("");setNewVehicleTeam(availableTeams[0]);}} style={{ flex:1, padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:13.5, fontWeight:600, cursor:"pointer" }}>Cancel</button>
+            )}
+            <button onClick={()=>{
+              if (isEditing) updateVehicle(vehicleEditTarget.id, { plate: plateTrimmed, team: newVehicleTeam });
+              else addVehicle(plateTrimmed, newVehicleTeam);
+              setVehicleEditTarget(null); setNewVehiclePlate(""); setNewVehicleTeam(availableTeams[0]);
+            }} disabled={!canSave} style={{ flex:2, padding:13, borderRadius:12, border:"none", background: canSave?BLUE:"#F0F1F4", color: canSave?"white":"#B0B4BC", fontSize:13.5, fontWeight:700, cursor: canSave?"pointer":"not-allowed", display:"flex", alignItems:"center", justifyContent:"center", gap:7 }}>
+              {isEditing ? <><Check size={15} /> Save changes</> : <><Plus size={15} /> Add vehicle</>}
+            </button>
+          </div>
+        </div>
+
+        {/* Vehicle list, grouped by team */}
+        {availableTeams.map((t) => {
+          const teamVehicleList = remoteVehicles.filter(v => v.team === t && v.active !== false).sort((a,b)=>a.plate.localeCompare(b.plate));
+          const accent = teamAccent(t);
+          return (
+            <div key={t} style={{ marginBottom:22 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10 }}>
+                <TeamIcon team={t} size={16} color={accent} />
+                <span style={{ fontSize:12, fontWeight:700, color:accent, textTransform:"uppercase", letterSpacing:0.4 }}>{teamLabel(t)} · {teamVehicleList.length}</span>
+              </div>
+              {teamVehicleList.length === 0 && (
+                <div style={{ fontSize:12.5, color:SLATE_LIGHT, fontStyle:"italic", padding:"8px 0" }}>No vehicles added yet for this team.</div>
+              )}
+              {teamVehicleList.map((v) => (
+                <div key={v.id} style={{ display:"flex", alignItems:"center", gap:10, border:`1px solid ${BORDER}`, borderRadius:11, padding:"11px 13px", marginBottom:8, background:"white" }}>
+                  <Truck size={15} color={accent} style={{ flexShrink:0 }} />
+                  <span style={{ flex:1, fontSize:13.5, fontWeight:600, color:INK }}>{v.plate}</span>
+                  <button onClick={()=>{setVehicleEditTarget(v);setNewVehiclePlate(v.plate);setNewVehicleTeam(v.team);}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:8, padding:"7px 12px", fontSize:11.5, fontWeight:600, color:BLUE, cursor:"pointer" }}>Edit</button>
+                  <button onClick={()=>setVehicleDeleteTarget(v)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:8, padding:"7px 12px", fontSize:11.5, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
+                </div>
+              ))}
+            </div>
+          );
+        })}
+
+        <div style={{ fontSize:11, color:SLATE_LIGHT, textAlign:"center", marginTop:8 }}>"Others" is always available as a built-in option in every check-in and fuel screen, for vehicles not in this list.</div>
+      </Shell>
+    );
+  }
+
   // ════════════════════════════════════════════════════════════════════
   // LEAVE BOARD
   // ════════════════════════════════════════════════════════════════════
@@ -3255,8 +3612,8 @@ export default function AimflowMasterApp() {
               </div>
               {canEdit(e) && (
                 <div style={{ display:"flex", flexDirection:"column", gap:6, flexShrink:0 }}>
-                  <button onClick={()=>{setLeaveDraft({type:e.type,startDate:e.startDate,endDate:e.endDate,note:e.note||""});setLeaveEditTarget(e.id);setScreen("leavePost");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:8, padding:"5px 10px", fontSize:11, fontWeight:600, color:BLUE, cursor:"pointer" }}>Edit</button>
-                  <button onClick={()=>setLeaveDeleteTarget(e)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:8, padding:"5px 10px", fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
+                  <button onClick={()=>{setLeaveDraft({type:e.type,startDate:e.startDate,endDate:e.endDate,note:e.note||""});setLeaveEditTarget(e.id);setScreen("leavePost");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:9, padding:"9px 14px", minHeight:36, fontSize:11, fontWeight:600, color:BLUE, cursor:"pointer" }}>Edit</button>
+                  <button onClick={()=>setLeaveDeleteTarget(e)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:9, padding:"9px 14px", minHeight:36, fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
                 </div>
               )}
             </div>
@@ -3278,8 +3635,8 @@ export default function AimflowMasterApp() {
                   </div>
                   {canEdit(e) && (
                     <div style={{ display:"flex", flexDirection:"column", gap:6, flexShrink:0 }}>
-                      <button onClick={()=>{setLeaveDraft({type:e.type,startDate:e.startDate,endDate:e.endDate,note:e.note||""});setLeaveEditTarget(e.id);setScreen("leavePost");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:8, padding:"5px 10px", fontSize:11, fontWeight:600, color:BLUE, cursor:"pointer" }}>Edit</button>
-                      <button onClick={()=>setLeaveDeleteTarget(e)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:8, padding:"5px 10px", fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
+                      <button onClick={()=>{setLeaveDraft({type:e.type,startDate:e.startDate,endDate:e.endDate,note:e.note||""});setLeaveEditTarget(e.id);setScreen("leavePost");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:9, padding:"9px 14px", minHeight:36, fontSize:11, fontWeight:600, color:BLUE, cursor:"pointer" }}>Edit</button>
+                      <button onClick={()=>setLeaveDeleteTarget(e)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:9, padding:"9px 14px", minHeight:36, fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
                     </div>
                   )}
                 </div>
@@ -3351,8 +3708,8 @@ export default function AimflowMasterApp() {
                     </div>
                     {canEdit(e) && (
                       <div style={{ display:"flex", gap:6 }}>
-                        <button onClick={()=>{setLeaveDraft({type:e.type,startDate:e.startDate,endDate:e.endDate,note:e.note||""});setLeaveEditTarget(e.id);setScreen("leavePost");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:7, padding:"4px 9px", fontSize:11, fontWeight:600, color:BLUE, cursor:"pointer" }}>Edit</button>
-                        <button onClick={()=>setLeaveDeleteTarget(e)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:7, padding:"4px 9px", fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
+                        <button onClick={()=>{setLeaveDraft({type:e.type,startDate:e.startDate,endDate:e.endDate,note:e.note||""});setLeaveEditTarget(e.id);setScreen("leavePost");}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:9, padding:"9px 14px", minHeight:36, fontSize:11, fontWeight:600, color:BLUE, cursor:"pointer" }}>Edit</button>
+                        <button onClick={()=>setLeaveDeleteTarget(e)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:9, padding:"9px 14px", minHeight:36, fontSize:11, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
                       </div>
                     )}
                   </div>
