@@ -26,17 +26,10 @@ export default defineConfig({
       },
       workbox: {
         globPatterns: ["**/*.{js,css,html,ico,png,svg}"],
-        runtimeCaching: [
-          {
-            urlPattern: /^https:\/\/firestore\.googleapis\.com\/.*/i,
-            handler: "NetworkFirst",
-            options: {
-              cacheName: "firestore-cache",
-              networkTimeoutSeconds: 10,
-              cacheableResponse: { statuses: [0, 200] }
-            }
-          }
-        ]
+        // Firestore's real-time connection is a long-lived stream, not a regular
+        // request/response — it can't be cached by the service worker, and trying to
+        // causes "Cache.put() network error" + broken Listen stream errors. Firestore
+        // already has its own offline persistence built in, so no caching rule is needed here.
       }
     })
   ]
