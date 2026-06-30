@@ -1131,6 +1131,14 @@ export default function AimflowMasterApp() {
   }, []);
   const lastActivityRef = useRef(Date.now());
 
+  // Reset scroll position to the top every time the screen changes. Without this, the browser
+  // keeps whatever scroll position you were at on the previous screen — so navigating from
+  // partway down a long list (e.g. scrolled into "Leave board") lands you partway down the
+  // NEW screen too, cutting off its header until you manually scroll back up.
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [screen]);
+
   // ── Transient UI state ────────────────────────────────────────────
   const [draft, setDraft] = useState(emptyDraft());
   const [checkoutDraft, setCheckoutDraft] = useState(emptyCheckout());
