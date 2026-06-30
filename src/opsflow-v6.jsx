@@ -565,13 +565,13 @@ function Shell({ children }) {
   const syncing = useSyncingIndicator();
   const shellRef = useRef(null);
   const { pullDistance, refreshed, isReady } = usePullToRefresh(shellRef);
-  // env(safe-area-inset-top) only returns a real, non-zero value inside an installed PWA on
-  // a notched device. In a regular browser tab — or on devices/browsers where it doesn't
-  // resolve cleanly — it returns 0, and CSS's own fallback syntax (env(x, 16px)) only kicks
-  // in when the property is unsupported entirely, not when it resolves to 0. Using max() here
-  // guarantees real clearance under the status bar in every case, not just the PWA-installed one.
-  const safeTop = "max(env(safe-area-inset-top, 0px), 28px)";
-  const safeBottom = "max(env(safe-area-inset-bottom, 0px), 20px)";
+  // With apple-mobile-web-app-status-bar-style set to "default" (in index.html), iOS reserves
+  // real, solid space for the status bar instead of letting content draw underneath it — so we
+  // no longer need to fight for safe-area clearance with a tall fallback. A small top padding
+  // plus env(safe-area-inset-top) (mainly relevant for the bottom home-indicator bar and any
+  // landscape/notch edge cases) is enough now that the platform handles the main overlap itself.
+  const safeTop = "calc(env(safe-area-inset-top, 0px) + 12px)";
+  const safeBottom = "calc(env(safe-area-inset-bottom, 0px) + 16px)";
   return (
     <div ref={shellRef} style={{ minHeight:"100vh", background:CANVAS, fontFamily:"'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", display:"flex", justifyContent:"center", paddingTop:safeTop, paddingBottom:safeBottom, paddingLeft:"env(safe-area-inset-left, 0px)", paddingRight:"env(safe-area-inset-right, 0px)" }}>
       <div style={{ width:"100%", maxWidth:420, padding:"16px 16px 40px", position:"relative", transform: pullDistance > 0 ? `translateY(${pullDistance}px)` : "none", transition: pullDistance === 0 ? "transform 0.25s ease-out" : "none" }}>
@@ -1569,6 +1569,13 @@ export default function AimflowMasterApp() {
           <button onClick={()=>{setLogTeamFilter(session.team);setScreen("jobLogView");}} style={tileStyle()}>
             <span style={{ ...tileIconStyle, background:PURPLE_LIGHT }}><Users size={22} color={PURPLE} /></span>
             <span style={{ flex:1 }}><span style={tileTitleStyle}>Team logs</span><span style={tileSubStyle}>See your team's job activity</span></span>
+          </button>
+        )}
+
+        {isWorker && (
+          <button onClick={()=>{setLogPersonName(null);setScreen("personnelLog");}} style={tileStyle()}>
+            <span style={{ ...tileIconStyle, background:BLUE_LIGHT }}><Search size={22} color={BLUE} /></span>
+            <span style={{ flex:1 }}><span style={tileTitleStyle}>Look up a teammate</span><span style={tileSubStyle}>Find one person's job history</span></span>
           </button>
         )}
 
@@ -2995,9 +3002,6 @@ export default function AimflowMasterApp() {
     return (
       <Shell>
         <Header title={`${teamLabel(logTeamFilter)} jobs`} onBack={()=>goBack("jobLogTeam")} accent={accent} />
-        <button onClick={()=>{setLogPersonName(null);setScreen("personnelLog");}} style={{ display:"flex", alignItems:"center", gap:6, background:"none", border:"none", color:accent, fontSize:12.5, fontWeight:600, cursor:"pointer", padding:0, marginBottom:14 }}>
-          <Users size={13} /> Look up one teammate instead
-        </button>
         <div style={{ display:"flex", gap:10, marginBottom:14 }}>
           <div style={{ flex:1, background:"white", border:`1px solid ${BORDER}`, borderRadius:13, padding:"12px 14px" }}>
             <div style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3, marginBottom:4 }}>TOTAL HRS</div>
