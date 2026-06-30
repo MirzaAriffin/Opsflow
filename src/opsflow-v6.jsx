@@ -898,22 +898,28 @@ function TeamLastFuelCard({ team, fuelHistory, onClick }) {
   const delta = lastFillUp ? mileageDeltaFor(lastFillUp, fuelHistory) : null;
 
   return (
-    <button onClick={onClick} style={{ width:"100%", display:"flex", alignItems:"center", gap:10, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", marginBottom:8, padding:"10px 13px", cursor:"pointer", textAlign:"left" }}>
-      <div style={{ width:32, height:32, borderRadius:9, background:AMBER_LIGHT, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
-        <Fuel size={14} color={AMBER_DARK} />
+    <button onClick={onClick} style={{ width:"100%", display:"flex", flexDirection:"column", gap:0, borderRadius:12, border:`1px solid ${accent}33`, background:`${accent}06`, marginBottom:8, cursor:"pointer", textAlign:"left", overflow:"hidden" }}>
+      <div style={{ padding:"7px 12px", borderBottom:`1px solid ${accent}1f`, display:"flex", alignItems:"center", gap:7 }}>
+        <TeamIcon team={team} size={13} color={accent} />
+        <span style={{ fontSize:11.5, fontWeight:700, color:accent }}>{teamLabel(team)} team</span>
       </div>
-      <div style={{ flex:1, minWidth:0 }}>
-        {lastFillUp ? (
-          <>
-            <div style={{ fontSize:12.5, fontWeight:700, color:INK, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{lastFillUp.vehicle}</div>
-            <div style={{ fontSize:11, color:SLATE }}>
-              {lastFillUp.person} · {new Date(lastFillUp.date).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
-              {delta !== null && ` · +${delta.toFixed(0)} km`}
-            </div>
-          </>
-        ) : (
-          <div style={{ fontSize:12, color:SLATE_LIGHT }}>No fill-ups logged yet</div>
-        )}
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"9px 12px" }}>
+        <div style={{ width:30, height:30, borderRadius:8, background:AMBER_LIGHT, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+          <Fuel size={13} color={AMBER_DARK} />
+        </div>
+        <div style={{ flex:1, minWidth:0 }}>
+          {lastFillUp ? (
+            <>
+              <div style={{ fontSize:12.5, fontWeight:700, color:INK, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{lastFillUp.vehicle}</div>
+              <div style={{ fontSize:11, color:SLATE }}>
+                {lastFillUp.person} · {new Date(lastFillUp.date).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
+                {delta !== null && ` · +${delta.toFixed(0)} km`}
+              </div>
+            </>
+          ) : (
+            <div style={{ fontSize:12, color:SLATE_LIGHT }}>No fill-ups logged yet</div>
+          )}
+        </div>
       </div>
     </button>
   );
@@ -1111,6 +1117,8 @@ export default function AimflowMasterApp() {
   // because some screens are reachable from more than one place (e.g. fuelLogVehicle from
   // both the team-logs flow AND directly from a dashboard shortcut) — a hardcoded back
   // button only knows the "usual" path, so it can send you somewhere you didn't come from.
+  // (goBack itself is declared further below, after the draft/target state it depends on
+  // for screenIsValid — see that block for why.)
   const screenHistoryRef = useRef([]);
   const setScreen = useCallback((next) => {
     setScreenRaw((current) => {
@@ -1118,17 +1126,7 @@ export default function AimflowMasterApp() {
       return next;
     });
   }, []);
-  const goBack = useCallback((fallback) => {
-    setScreenRaw(() => {
-      const hist = screenHistoryRef.current;
-      if (hist.length > 0) {
-        const prev = hist[hist.length - 1];
-        screenHistoryRef.current = hist.slice(0, -1);
-        return prev;
-      }
-      return fallback || "landing";
-    });
-  }, []);
+
   const lastActivityRef = useRef(Date.now());
 
   // Reset scroll position to the top every time the screen changes. Without this, the browser
@@ -1187,6 +1185,44 @@ export default function AimflowMasterApp() {
   const [showSupAssign, setShowSupAssign] = useState(false);
   const [longJobWarningDismissed, setLongJobWarningDismissed] = useState(false);
   const [newUserDraft, setNewUserDraft] = useState(null);
+  // Some screens require a piece of draft/target state to render correctly (e.g. leavePost
+  // needs leaveDraft, reviewReject needs reviewTarget). If that state gets cleared after a
+  // successful submit/cancel — which can happen at any point relative to when the screen
+  // name was pushed onto history — pressing back could land on a screen with missing
+  // required data, falling through to the "Unexpected screen" fallback. screenIsValid checks
+  // each screen's actual requirement at the moment goBack tries to render it, so it can keep
+  // popping past any now-invalid entries instead of getting stuck on one.
+  const screenIsValid = useCallback((s) => {
+    switch (s) {
+      case "filedTimes": case "filedVehicle": case "filedSite": case "filedService":
+      case "filedJobsheet": case "filedReview": return !!filedDraft;
+      case "reviewReject": return !!reviewTarget;
+      case "fuelVehicle": return !!fuelDraft.team;
+      case "fuelDetails": return !!fuelDraft.vehicle;
+      case "editEntry": return !!editTarget && !!editDraft;
+      case "entryDeleteConfirm": return !!entryDeleteTarget;
+      case "deleteConfirm": return !!deleteTarget;
+      case "adminAddUser": return newUserDraft !== null;
+      case "adminPinEdit": return !!pinEditTarget;
+      case "leavePost": return leaveDraft !== null;
+      default: return true; // screens with no draft/target requirement are always valid
+    }
+  }, [filedDraft, reviewTarget, fuelDraft, editTarget, editDraft, entryDeleteTarget, deleteTarget, newUserDraft, pinEditTarget, leaveDraft]);
+  const goBack = useCallback((fallback) => {
+    setScreenRaw(() => {
+      let hist = screenHistoryRef.current;
+      while (hist.length > 0 && !screenIsValid(hist[hist.length - 1])) {
+        hist = hist.slice(0, -1); // skip past any stale entries whose required state is gone
+      }
+      if (hist.length > 0) {
+        const prev = hist[hist.length - 1];
+        screenHistoryRef.current = hist.slice(0, -1);
+        return prev;
+      }
+      screenHistoryRef.current = [];
+      return fallback || "landing";
+    });
+  }, [screenIsValid]);
   const [editUserTeam, setEditUserTeam] = useState(undefined);
   const [pinEditConfirmAction, setPinEditConfirmAction] = useState(null); // null | "remove" | "revoke" | "rename"
   const [nameEditValue, setNameEditValue] = useState("");
@@ -1870,8 +1906,8 @@ export default function AimflowMasterApp() {
               <button onClick={setLastMonth} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:12, fontWeight:600, cursor:"pointer" }}>Last month</button>
             </div>
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
-              <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>From</div><input type="date" value={archiveRangeStart} onChange={(e)=>setArchiveRangeStart(e.target.value)} style={{ ...inputStyle, marginBottom:0 }} /></div>
-              <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>To</div><input type="date" value={archiveRangeEnd} min={archiveRangeStart} onChange={(e)=>setArchiveRangeEnd(e.target.value)} style={{ ...inputStyle, marginBottom:0 }} /></div>
+              <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>From</div><input type="date" value={archiveRangeStart} onChange={(e)=>setArchiveRangeStart(e.target.value)} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
+              <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>To</div><input type="date" value={archiveRangeEnd} min={archiveRangeStart} onChange={(e)=>setArchiveRangeEnd(e.target.value)} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
             </div>
           </>
         )}
@@ -2655,7 +2691,8 @@ export default function AimflowMasterApp() {
             remarks:filedDraft.remarks||"", reason:filedDraft.reason,
             status:"pending", filedAt:Date.now(), originalDraft:filedDraft,
           };
-          addFiledEntry(entry); setFiledDraft(null);
+          addFiledEntry(entry);
+          setFiledDraft(null);
           setScreen("filedDone");
         }}>
           <FileClock size={16} /> Submit for approval
@@ -3015,9 +3052,9 @@ export default function AimflowMasterApp() {
             <div style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3, marginBottom:4 }}>TOTAL HRS</div>
             <div style={{ fontSize:19, fontWeight:800, color:INK }}>{totHrs.toFixed(1)}</div>
           </div>
-          <div style={{ flex:1, background:"white", border:`1px solid ${BORDER}`, borderRadius:13, padding:"12px 14px" }}>
-            <div style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3, marginBottom:4 }}>TOTAL OT</div>
-            <div style={{ fontSize:19, fontWeight:800, color:INK }}>{totOT.toFixed(1)}</div>
+          <div style={{ flex:1, background:isAdminOrSup?"white":CANVAS, border:`1px solid ${BORDER}`, borderRadius:13, padding:"12px 14px" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:4 }}>{!isAdminOrSup&&<Lock size={10} color={SLATE_LIGHT} />}<div style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3 }}>TOTAL OT</div></div>
+            {isAdminOrSup ? <div style={{ fontSize:19, fontWeight:800, color:INK }}>{totOT.toFixed(1)}</div> : <div style={{ fontSize:12.5, fontWeight:700, color:SLATE_LIGHT, marginTop:2 }}>Not authorised</div>}
           </div>
           <div style={{ flex:1, background:"white", border:`1px solid ${BORDER}`, borderRadius:13, padding:"12px 14px" }}>
             <div style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3, marginBottom:4 }}>JOBS</div>
@@ -3089,29 +3126,9 @@ export default function AimflowMasterApp() {
     let myJobs = [...currentJobHistory.filter((j)=>jobCreditedPeople(j).includes(involvedTarget))].sort((a,b)=>b.checkInTime-a.checkInTime);
     const totals = personTotals(currentJobHistory, involvedTarget);
     const otVisible = canSeeOT(session,involvedTarget);
-    // Team total (aggregate, payroll view) — visible to everyone, OT is never broken down per-person here
-    const myOwnTeam = userDirectory.find((u)=>u.name===session.name)?.team || session.team;
-    const relevantTeams = canPickAnyone ? ["tanker","jetting","watertank"] : [myOwnTeam].filter(Boolean);
     return (
       <Shell>
         <Header title="Personnel log" onBack={()=>goBack(isWorker?"landing":"logsHome")} accent={PURPLE} />
-
-        {/* Team totals — aggregate only, no per-person OT exposure */}
-        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Team totals</div>
-        {relevantTeams.map((t) => {
-          const teamJobs = currentJobHistory.filter((j)=>j.team===t);
-          const { hours, ot } = teamTotals(teamJobs);
-          const accent = teamAccent(t);
-          return (
-            <div key={t} style={{ display:"flex", alignItems:"center", gap:12, border:`1px solid ${BORDER}`, borderRadius:12, padding:"12px 14px", marginBottom:8, background:"white" }}>
-              <TeamIcon team={t} size={18} color={accent} />
-              <span style={{ fontSize:13, fontWeight:700, color:INK, flex:1 }}>{teamLabel(t)}</span>
-              <span style={{ fontSize:12, color:SLATE, fontWeight:600 }}>{hours.toFixed(1)} hrs</span>
-              <span style={{ fontSize:12, color:AMBER_DARK, fontWeight:700, background:AMBER_LIGHT, borderRadius:8, padding:"3px 9px" }}>{ot.toFixed(1)} OT</span>
-            </div>
-          );
-        })}
-        <div style={{ fontSize:10.5, color:SLATE_LIGHT, fontStyle:"italic", marginBottom:18 }}>Team totals are combined across everyone on the team — individual hours below are private.</div>
 
         <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Individual logs</div>
         <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>{canPickAnyone?"Select a person":"Select a teammate"}</div>
@@ -3612,7 +3629,7 @@ export default function AimflowMasterApp() {
             body="This permanently removes their access to Opsflow. Their existing job and fuel history is kept for records, but they will no longer be able to log in. This cannot be undone from the app — you would need to add them back as a new user."
             confirmLabel="Remove user"
             onCancel={()=>setPinEditConfirmAction(null)}
-            onConfirm={()=>{ removeUser(pinEditTarget); setEditUserTeam(undefined); setPinEditConfirmAction(null); setScreen("adminUsers"); }}
+            onConfirm={()=>{ removeUser(pinEditTarget); setEditUserTeam(undefined); setPinEditConfirmAction(null); setPinEditTarget(null); setScreen("adminUsers"); }}
           />
         )}
         {pinEditConfirmAction === "revoke" && (
@@ -3959,7 +3976,7 @@ export default function AimflowMasterApp() {
             </select>
           </>
         )}
-        <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>Leave type</div>
+        <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>Leave type <span style={{ color:RED }}>*</span></div>
         <div style={{ display:"flex", flexDirection:"column", gap:7, marginBottom:18 }}>
           {LEAVE_TYPES.map((lt)=>{
             const isSel=leaveDraft.type===lt.key;
@@ -3971,12 +3988,15 @@ export default function AimflowMasterApp() {
           })}
         </div>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-          <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Start date</div><input type="date" value={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,startDate:e.target.value,endDate:leaveDraft.endDate||e.target.value})} style={{ ...inputStyle, marginBottom:0 }} /></div>
-          <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>End date</div><input type="date" value={leaveDraft.endDate} min={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,endDate:e.target.value})} style={{ ...inputStyle, marginBottom:0 }} /></div>
+          <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Start date</div><input type="date" value={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,startDate:e.target.value,endDate:leaveDraft.endDate||e.target.value})} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
+          <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>End date</div><input type="date" value={leaveDraft.endDate} min={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,endDate:e.target.value})} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
         </div>
         {leaveDraft.startDate&&leaveDraft.endDate&&leaveDraft.startDate<=leaveDraft.endDate && <div style={{ fontSize:12, color:SLATE_LIGHT, margin:"6px 0 14px" }}>{leaveDayCount(leaveDraft.startDate,leaveDraft.endDate)} day{leaveDayCount(leaveDraft.startDate,leaveDraft.endDate)!==1?"s":""}</div>}
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Note (optional)</div>
         <input value={leaveDraft.note||""} onChange={(e)=>setLeaveDraft({...leaveDraft,note:e.target.value})} placeholder="e.g. Hospital appointment, family trip…" style={{ ...inputStyle, marginBottom:18 }} />
+        {!leaveDraft.type && <div style={{ display:"flex", gap:8, background:AMBER_LIGHT, borderRadius:11, padding:"10px 13px", marginBottom:14, fontSize:12, color:AMBER_DARK }}><AlertTriangle size={15} style={{ flexShrink:0, marginTop:1 }} /><span>Select a leave type above before posting.</span></div>}
+        {leaveDraft.type && (!leaveDraft.startDate || !leaveDraft.endDate) && <div style={{ display:"flex", gap:8, background:AMBER_LIGHT, borderRadius:11, padding:"10px 13px", marginBottom:14, fontSize:12, color:AMBER_DARK }}><AlertTriangle size={15} style={{ flexShrink:0, marginTop:1 }} /><span>Select a start and end date before posting.</span></div>}
+        {leaveDraft.startDate && leaveDraft.endDate && leaveDraft.startDate > leaveDraft.endDate && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"10px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={15} style={{ flexShrink:0, marginTop:1 }} /><span>End date can't be before the start date.</span></div>}
         <PrimaryButton accent={GREEN_DARK} disabled={!valid} onClick={()=>{
           const personName=canPostForOthers?(leaveDraft.forName||session.name):session.name;
           const personUser=userDirectory.find((u)=>u.name===personName);
