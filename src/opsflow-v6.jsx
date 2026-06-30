@@ -89,8 +89,21 @@ const USERS_DEFAULT = [
 const BETA_TEST_USER = {name:"Beta Tester",role:"beta",team:null,pin:"B0000"};
 const CASUAL_LABOUR_OPTION = "Casual labour (type name)";
 
-function sortedWorkers(team,dir=USERS_DEFAULT) { return dir.filter(u=>u.role==="worker"&&u.team===team).map(u=>u.name).sort((a,b)=>a.localeCompare(b)); }
-function buildTeamWorkerOptions(team,dir=USERS_DEFAULT) { const own=sortedWorkers(team,dir); const other=["tanker","jetting","watertank"].filter(t=>t!==team).flatMap(t=>sortedWorkers(t,dir)); return {own,other,flat:[...own,...other,CASUAL_LABOUR_OPTION]}; }
+function sortedWorkers(team,dir=USERS_DEFAULT) {
+  // Workers on this team, plus supervisors assigned to this team (e.g. Mirza for tanker, Kassim for all three).
+  const workers = dir.filter(u=>u.role==="worker"&&u.team===team);
+  const sups = dir.filter(u=>u.role==="supervisor"&&(u.supervisorTeams||[]).includes(team));
+  return [...workers, ...sups].map(u=>u.name).sort((a,b)=>a.localeCompare(b));
+}
+function buildTeamWorkerOptions(team,dir=USERS_DEFAULT) {
+  const own = sortedWorkers(team,dir);
+  const otherTeams = ["tanker","jetting","watertank"].filter(t=>t!==team);
+  // "Other" = workers/supervisors from other teams, excluding anyone already counted in "own"
+  // (e.g. Kassim covers all teams, so he should only show once, in "own").
+  const otherRaw = otherTeams.flatMap(t=>sortedWorkers(t,dir));
+  const other = [...new Set(otherRaw)].filter(name=>!own.includes(name));
+  return {own,other,flat:[...own,...other,CASUAL_LABOUR_OPTION]};
+}
 function teamWorkerOptions(team,dir=USERS_DEFAULT) { return buildTeamWorkerOptions(team,dir); }
 function isJettingVehicle(label) { return label&&label.startsWith("Jetting Truck"); }
 function findUserByPin(pin,dir) { if(pin===BETA_TEST_USER.pin)return BETA_TEST_USER; return dir.find(u=>u.pin===pin)||null; }
@@ -1607,7 +1620,7 @@ export default function AimflowMasterApp() {
       const vehicles = isSel ? draft.vehicles.filter((x)=>x!==v) : [...draft.vehicles,v];
       const crewByVehicle = {...draft.crewByVehicle};
       if (isSel) delete crewByVehicle[v];
-      else if (!crewByVehicle[v]) crewByVehicle[v]=[draft.checker];
+      else if (!crewByVehicle[v]) crewByVehicle[v]=[]; // crew starts empty — must be explicitly selected, never assumed
       setDraft({...draft,vehicles,crewByVehicle});
     };
     const toggleCrewMember = (vehicle,name) => {
@@ -1885,6 +1898,7 @@ export default function AimflowMasterApp() {
         {isLong && <div style={{ display:"flex", gap:8, background:AMBER_LIGHT, borderRadius:12, padding:"12px 14px", marginBottom:14, fontSize:12, color:AMBER_DARK }}><AlertTriangle size={16} style={{ flexShrink:0 }} /><span>⚠️ This job exceeded 12 hours ({hours} hrs). Supervisor and admin will be flagged.</span></div>}
         <ReviewBlock rows={[
           ["Site", myActiveJob.jobSite],
+          ["Personnel credited", (myActiveJob.crew||[]).join(", ")||"—"],
           ["Services", serviceSummary],
           ["Jobsheet #", checkoutDraft.jobsheet],
           ...(!isJetting ? [["PUB disposal #", checkoutDraft.pubDisposal]] : []),
@@ -1990,7 +2004,7 @@ export default function AimflowMasterApp() {
 
   if (screen === "filedVehicle" && filedDraft) {
     const accent="#C2570C";
-    const toggleVehicle=(v)=>{ const isSel=filedDraft.vehicles.includes(v); const vehicles=isSel?filedDraft.vehicles.filter((x)=>x!==v):[...filedDraft.vehicles,v]; const crewByVehicle={...filedDraft.crewByVehicle}; if(isSel)delete crewByVehicle[v]; else if(!crewByVehicle[v])crewByVehicle[v]=[session.name]; setFiledDraft({...filedDraft,vehicles,crewByVehicle}); };
+    const toggleVehicle=(v)=>{ const isSel=filedDraft.vehicles.includes(v); const vehicles=isSel?filedDraft.vehicles.filter((x)=>x!==v):[...filedDraft.vehicles,v]; const crewByVehicle={...filedDraft.crewByVehicle}; if(isSel)delete crewByVehicle[v]; else if(!crewByVehicle[v])crewByVehicle[v]=[]; setFiledDraft({...filedDraft,vehicles,crewByVehicle}); };
     const toggleCrewMember=(vehicle,name)=>{ const current=filedDraft.crewByVehicle[vehicle]||[]; const updated=current.includes(name)?current.filter((x)=>x!==name):[...current,name]; const crewCustomNames={...filedDraft.crewCustomNames}; if(name===CASUAL_LABOUR_OPTION&&!current.includes(name)){crewCustomNames[vehicle]=crewCustomNames[vehicle]?.length?crewCustomNames[vehicle]:[""];} setFiledDraft({...filedDraft,crewByVehicle:{...filedDraft.crewByVehicle,[vehicle]:updated},crewCustomNames}); };
     const setFiledCasualName=(vehicle,idx,val)=>{ const arr=[...(filedDraft.crewCustomNames[vehicle]||[""])]; arr[idx]=val; setFiledDraft({...filedDraft,crewCustomNames:{...filedDraft.crewCustomNames,[vehicle]:arr}}); };
     const addFiledCasualSlot=(vehicle)=>{ const arr=[...(filedDraft.crewCustomNames[vehicle]||[]),""]; setFiledDraft({...filedDraft,crewCustomNames:{...filedDraft.crewCustomNames,[vehicle]:arr}}); };
