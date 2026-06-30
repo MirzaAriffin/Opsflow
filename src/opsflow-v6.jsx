@@ -92,15 +92,18 @@ const CASUAL_LABOUR_OPTION = "Casual labour (type name)";
 function sortedWorkers(team,dir=USERS_DEFAULT) {
   return dir.filter(u=>u.role==="worker"&&u.team===team).map(u=>u.name).sort((a,b)=>a.localeCompare(b));
 }
-function sortedSupervisorsForTeam(team,dir=USERS_DEFAULT) {
-  return dir.filter(u=>u.role==="supervisor"&&(u.supervisorTeams||[]).includes(team)).map(u=>u.name).sort((a,b)=>a.localeCompare(b));
+function allSupervisors(dir=USERS_DEFAULT) {
+  // Every supervisor is selectable as personnel on any team's job — same principle as
+  // "helping from another team" for workers. supervisorTeams only controls dashboard/admin
+  // scoping (which teams they monitor), not who can be picked as crew on a job.
+  return dir.filter(u=>u.role==="supervisor").map(u=>u.name).sort((a,b)=>a.localeCompare(b));
 }
 function buildTeamWorkerOptions(team,dir=USERS_DEFAULT) {
   const own = sortedWorkers(team,dir);
-  const supervisors = sortedSupervisorsForTeam(team,dir);
+  const supervisors = allSupervisors(dir);
   const otherTeams = ["tanker","jetting","watertank"].filter(t=>t!==team);
   // "Other" = workers from other teams only (not their supervisors — supervisors get their own
-  // dedicated group above, regardless of which team they're assigned to).
+  // dedicated group above, and are always shown regardless of which team they manage).
   const otherRaw = otherTeams.flatMap(t=>sortedWorkers(t,dir));
   const other = [...new Set(otherRaw)].filter(name=>!own.includes(name));
   return {own,supervisors,other,flat:[...own,...supervisors,...other,CASUAL_LABOUR_OPTION]};
@@ -165,6 +168,21 @@ function teamTotals(jobs) {
 }
 
 function canSeeOT(session,ownerName) { return session.role==="admin"||session.role==="supervisor"||session.role==="beta"||session.name===ownerName; }
+
+// Distance traveled since the PREVIOUS fill-up for the SAME vehicle (not the same person —
+// any driver's fill-up counts toward the vehicle's running total). Returns null if there's
+// no valid prior reading to compare against (first ever fill-up, or missing/invalid odometer data).
+function mileageDeltaFor(fillUp, allFuelHistory) {
+  if (!fillUp || !fillUp.vehicle) return null;
+  const sameVehicle = allFuelHistory.filter(f => f.vehicle === fillUp.vehicle).sort((a,b) => a.date - b.date);
+  const idx = sameVehicle.findIndex(f => f.id === fillUp.id);
+  if (idx <= 0) return null; // first fill-up for this vehicle, or not found — nothing to compare against
+  const curM = parseFloat(fillUp.mileage);
+  const prevM = parseFloat(sameVehicle[idx - 1].mileage);
+  if (isNaN(curM) || isNaN(prevM)) return null;
+  const delta = curM - prevM;
+  return delta >= 0 ? delta : null; // negative delta means bad data entry (odometer rollback) — don't show a misleading number
+}
 
 // ── Empty drafts ─────────────────────────────────────────────────────
 const emptyDraft = ()=>({team:null,checker:null,gpsCaptured:false,manualCheckIn:"",vehicles:[],crewByVehicle:{},crewCustomNames:{},vehicleCustomPlates:{}});
@@ -470,10 +488,38 @@ function teamServicing(team) {
 
 const pillStyle = { fontSize:11, fontWeight:600, padding:"4px 9px", borderRadius:7, background:"rgba(255,255,255,0.18)" };
 
+// Lightweight global "is a Firestore write in flight" flag, readable by Shell from any of the
+// ~49 screen call sites without prop-drilling or needing a Context Provider wrapping the tree
+// (which isn't feasible here since screens are early-returned, not nested children).
+let globalSyncingState = false;
+const syncingListeners = new Set();
+function setGlobalSyncing(val) {
+  globalSyncingState = val;
+  syncingListeners.forEach(fn => fn(val));
+}
+function useSyncingIndicator() {
+  const [syncing, setSyncing] = useState(globalSyncingState);
+  useEffect(() => {
+    syncingListeners.add(setSyncing);
+    return () => syncingListeners.delete(setSyncing);
+  }, []);
+  return syncing;
+}
+
 function Shell({ children }) {
+  const syncing = useSyncingIndicator();
   return (
     <div style={{ minHeight:"100vh", background:CANVAS, fontFamily:"'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", display:"flex", justifyContent:"center", paddingTop:"env(safe-area-inset-top, 16px)", paddingBottom:"env(safe-area-inset-bottom, 24px)", paddingLeft:"env(safe-area-inset-left, 0px)", paddingRight:"env(safe-area-inset-right, 0px)" }}>
-      <div style={{ width:"100%", maxWidth:420, padding:"16px 16px 40px" }}>{children}</div>
+      <div style={{ width:"100%", maxWidth:420, padding:"16px 16px 40px", position:"relative" }}>
+        <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+        {syncing && (
+          <div style={{ position:"fixed", top:"calc(env(safe-area-inset-top, 16px) + 10px)", left:"50%", transform:"translateX(-50%)", zIndex:9998, display:"flex", alignItems:"center", gap:7, background:"rgba(17,24,39,0.88)", backdropFilter:"blur(4px)", color:"white", fontSize:11.5, fontWeight:600, padding:"7px 14px", borderRadius:20, boxShadow:"0 4px 14px rgba(17,24,39,0.25)" }}>
+            <div style={{ width:11, height:11, borderRadius:"50%", border:"2px solid rgba(255,255,255,0.3)", borderTop:"2px solid white", animation:"spin 0.7s linear infinite" }} />
+            Saving…
+          </div>
+        )}
+        {children}
+      </div>
     </div>
   );
 }
@@ -654,49 +700,36 @@ function FiledStatusCard({ entry: e, isReviewer, onApprove, onReject, onUndo, on
   );
 }
 
-function FuelStatusCard({ lastFillUp }) {
+function FuelStatusCard({ lastFillUp, fuelHistory }) {
   if (!lastFillUp) return (
-    <div style={{ border:`1px solid ${BORDER}`, borderRadius:16, padding:17, marginBottom:14, background:"white" }}>
-      <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:6 }}>
-        <span style={{ width:7, height:7, borderRadius:"50%", background:SLATE_LIGHT }} />
-        <span style={{ fontSize:11, fontWeight:700, letterSpacing:0.6, color:SLATE }}>FUEL</span>
-      </div>
-      <div style={{ fontSize:12, color:SLATE_LIGHT }}>No fill-ups logged yet</div>
+    <div style={{ border:`1px solid ${BORDER}`, borderRadius:13, padding:"11px 14px", marginBottom:12, background:"white", display:"flex", alignItems:"center", gap:8 }}>
+      <Fuel size={13} color={SLATE_LIGHT} />
+      <span style={{ fontSize:12, color:SLATE_LIGHT }}>No fill-ups logged yet</span>
     </div>
   );
   const daysAgo = Math.floor((Date.now()-lastFillUp.date)/86400000);
-  const whenLabel = daysAgo===0?"today":daysAgo===1?"yesterday":`${daysAgo} days ago`;
+  const whenLabel = daysAgo===0?"today":daysAgo===1?"yesterday":`${daysAgo}d ago`;
   const cpl = lastFillUp.amount && lastFillUp.price && parseFloat(lastFillUp.amount) > 0
     ? (parseFloat(lastFillUp.price)/parseFloat(lastFillUp.amount)).toFixed(3) : null;
+  const delta = mileageDeltaFor(lastFillUp, fuelHistory || []);
   return (
-    <div style={{ border:`1px solid ${BORDER}`, borderRadius:16, background:"white", marginBottom:14, overflow:"hidden" }}>
-      <div style={{ display:"flex", alignItems:"center", gap:8, padding:"12px 16px", borderBottom:`1px solid ${BORDER}`, background:AMBER_LIGHT }}>
-        <Fuel size={14} color={AMBER_DARK} />
-        <span style={{ fontSize:11, fontWeight:700, letterSpacing:0.6, color:AMBER_DARK }}>LAST FILL-UP · {whenLabel.toUpperCase()}</span>
+    <div style={{ border:`1px solid ${BORDER}`, borderRadius:13, background:"white", marginBottom:12, padding:"11px 14px" }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+          <Fuel size={12} color={AMBER_DARK} />
+          <span style={{ fontSize:10.5, fontWeight:700, letterSpacing:0.4, color:AMBER_DARK, textTransform:"uppercase" }}>Last fill-up · {whenLabel}</span>
+        </div>
       </div>
-      <div style={{ padding:"13px 16px" }}>
-        <div style={{ fontSize:15, fontWeight:700, color:INK, marginBottom:2 }}>{lastFillUp.vehicle}</div>
-        <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
-          {new Date(lastFillUp.date).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
-          {" · "}{new Date(lastFillUp.date).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
-          {" · Filled by "}{lastFillUp.person}
-        </div>
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:0 }}>
-          <div style={{ borderRight:`1px solid ${BORDER}`, paddingRight:12 }}>
-            <div style={{ fontSize:10, color:SLATE_LIGHT, fontWeight:700, letterSpacing:0.3, marginBottom:3, textTransform:"uppercase" }}>Litres</div>
-            <div style={{ fontSize:15, fontWeight:800, color:INK }}>{parseFloat(lastFillUp.amount).toFixed(1)}</div>
-          </div>
-          <div style={{ borderRight:`1px solid ${BORDER}`, paddingLeft:12, paddingRight:12 }}>
-            <div style={{ fontSize:10, color:SLATE_LIGHT, fontWeight:700, letterSpacing:0.3, marginBottom:3, textTransform:"uppercase" }}>Total</div>
-            <div style={{ fontSize:15, fontWeight:800, color:INK }}>S${parseFloat(lastFillUp.price).toFixed(2)}</div>
-            {cpl && <div style={{ fontSize:10, color:GREEN_DARK, fontWeight:600 }}>S${cpl}/L</div>}
-          </div>
-          <div style={{ paddingLeft:12 }}>
-            <div style={{ fontSize:10, color:SLATE_LIGHT, fontWeight:700, letterSpacing:0.3, marginBottom:3, textTransform:"uppercase" }}>Station</div>
-            <div style={{ fontSize:13, fontWeight:700, color:INK }}>{lastFillUp.company}</div>
-            {lastFillUp.mileage && <div style={{ fontSize:10, color:SLATE_LIGHT }}>{lastFillUp.mileage} km</div>}
-          </div>
-        </div>
+      <div style={{ fontSize:13, fontWeight:700, color:INK, marginBottom:2 }}>{lastFillUp.vehicle}</div>
+      <div style={{ fontSize:11, color:SLATE, marginBottom:8 }}>
+        {lastFillUp.person} · {lastFillUp.company}
+        {cpl && ` · S$${cpl}/L`}
+      </div>
+      <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+        <span style={{ fontSize:10.5, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{parseFloat(lastFillUp.amount).toFixed(1)} L</span>
+        <span style={{ fontSize:10.5, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>S${parseFloat(lastFillUp.price).toFixed(2)}</span>
+        {lastFillUp.mileage && <span style={{ fontSize:10.5, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{lastFillUp.mileage} km</span>}
+        {delta !== null && <span style={{ fontSize:10.5, fontWeight:600, padding:"3px 8px", borderRadius:6, background:BLUE_LIGHT, color:BLUE_DARK }}>+{delta.toFixed(0)} km since last</span>}
       </div>
     </div>
   );
@@ -772,6 +805,37 @@ function TeamLastJobCard({ team, jobHistory, filedEntries, onClick }) {
       ) : (
         <div style={{ padding:"10px 14px", fontSize:12, color:SLATE_LIGHT }}>No jobs logged yet</div>
       )}
+    </button>
+  );
+}
+
+// ── Team last-fuel card for supervisor/admin dashboard ─────────────────
+// Compact by design (per design feedback) — fuel fill-ups are frequent and lower-stakes
+// than a completed job, so this should never visually compete with TeamLastJobCard above it.
+function TeamLastFuelCard({ team, fuelHistory, onClick }) {
+  const accent = teamAccent(team);
+  const teamFuel = fuelHistory.filter((f) => f.team === team);
+  const lastFillUp = [...teamFuel].sort((a,b) => b.date - a.date)[0];
+  const delta = lastFillUp ? mileageDeltaFor(lastFillUp, fuelHistory) : null;
+
+  return (
+    <button onClick={onClick} style={{ width:"100%", display:"flex", alignItems:"center", gap:10, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", marginBottom:8, padding:"10px 13px", cursor:"pointer", textAlign:"left" }}>
+      <div style={{ width:32, height:32, borderRadius:9, background:AMBER_LIGHT, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+        <Fuel size={14} color={AMBER_DARK} />
+      </div>
+      <div style={{ flex:1, minWidth:0 }}>
+        {lastFillUp ? (
+          <>
+            <div style={{ fontSize:12.5, fontWeight:700, color:INK, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{lastFillUp.vehicle}</div>
+            <div style={{ fontSize:11, color:SLATE }}>
+              {lastFillUp.person} · {new Date(lastFillUp.date).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
+              {delta !== null && ` · +${delta.toFixed(0)} km`}
+            </div>
+          </>
+        ) : (
+          <div style={{ fontSize:12, color:SLATE_LIGHT }}>No fill-ups logged yet</div>
+        )}
+      </div>
     </button>
   );
 }
@@ -913,7 +977,7 @@ function LoginScreen({ onLogin, userDirectory }) {
             <div style={{ fontSize:15, fontWeight:700, color:INK, marginBottom:3 }}>Welcome back</div>
             <div style={{ fontSize:12.5, color:SLATE }}>Enter your PIN to continue</div>
           </div>
-          <input autoFocus value={pin} disabled={isLocked} onChange={(e)=>{setError(null);setPin(e.target.value.toUpperCase().slice(0,8));}} onKeyDown={(e)=>{if(e.key==="Enter")handleSubmit();}} placeholder="PIN" style={{ width:"100%", textAlign:"center", letterSpacing:6, fontSize:22, fontWeight:800, color:BLUE_DARK, padding:"16px 12px", borderRadius:13, border:`1.5px solid ${pin?BLUE:BORDER}`, background:pin?BLUE_LIGHT:CANVAS, marginBottom:16, boxSizing:"border-box", textTransform:"uppercase", transition:"all 0.15s" }} />
+          <input id="pin-input" name="pin" autoComplete="off" autoFocus value={pin} disabled={isLocked} onChange={(e)=>{setError(null);setPin(e.target.value.toUpperCase().slice(0,8));}} onKeyDown={(e)=>{if(e.key==="Enter")handleSubmit();}} placeholder="PIN" style={{ width:"100%", textAlign:"center", letterSpacing:6, fontSize:22, fontWeight:800, color:BLUE_DARK, padding:"16px 12px", borderRadius:13, border:`1.5px solid ${pin?BLUE:BORDER}`, background:pin?BLUE_LIGHT:CANVAS, marginBottom:16, boxSizing:"border-box", textTransform:"uppercase", transition:"all 0.15s" }} />
           {isLocked && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><Lock size={16} style={{ flexShrink:0, marginTop:1 }} /><span>Locked. Try again in {Math.floor(lockSecondsLeft/60)}:{String(lockSecondsLeft%60).padStart(2,"0")}.</span></div>}
           {!isLocked && error && <div style={{ display:"flex", gap:8, background:AMBER_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:AMBER_DARK }}><AlertCircle size={16} style={{ flexShrink:0, marginTop:1 }} /><span>{error}</span></div>}
           <PrimaryButton disabled={isLocked||pin.length<4} onClick={handleSubmit}><KeyRound size={16} /> Log in</PrimaryButton>
@@ -1011,6 +1075,7 @@ export default function AimflowMasterApp() {
   const [pinEditConfirmAction, setPinEditConfirmAction] = useState(null); // null | "remove" | "revoke" | "rename"
   const [nameEditValue, setNameEditValue] = useState("");
   const [syncError, setSyncError] = useState(null);
+  const syncOpCountRef = useRef(0); // tracks overlapping in-flight Firestore writes for the global "Saving…" indicator
   const [betaActiveJobs, setBetaActiveJobs] = useState([]);
   const [betaJobHistory, setBetaJobHistory] = useState([]);
   const [betaFuelHistory, setBetaFuelHistory] = useState([]);
@@ -1069,7 +1134,16 @@ export default function AimflowMasterApp() {
   const handleLogout = () => { setSession(null); setScreen("landing"); setDraft(emptyDraft()); setCheckoutDraft(emptyCheckout()); setFuelDraft(emptyFuelDraft()); setLogPersonName(null); setLogVehicleName(null); setLogTeamFilter(null); };
 
   // ── Firestore write helpers ───────────────────────────────────────
-  const fsOp = async (fn) => { try { await fn(); setSyncError(null); } catch(e) { console.error(e); setSyncError("Sync error — check your connection."); } };
+  const fsOp = async (fn) => {
+    syncOpCountRef.current += 1;
+    setGlobalSyncing(true);
+    try { await fn(); setSyncError(null); }
+    catch(e) { console.error(e); setSyncError("Sync error — check your connection."); }
+    finally {
+      syncOpCountRef.current -= 1;
+      if (syncOpCountRef.current <= 0) { syncOpCountRef.current = 0; setGlobalSyncing(false); }
+    }
+  };
   const addJob = (job) => fsOp(() => fsSet(COL.jobs, job.id, job));
   const updateJob = (id, data) => fsOp(() => fsUpdate(COL.jobs, id, data));
   const deleteJob = (id) => fsOp(() => fsDelete(COL.jobs, id));
@@ -1268,17 +1342,20 @@ export default function AimflowMasterApp() {
         {/* Informational badge — I'm listed as crew on someone else's currently active job.
             Read-only: no lock, no checkout access. I can still independently check into a different job. */}
         {myCrewActiveJobs.length > 0 && myCrewActiveJobs.map((j) => (
-          <div key={j.id} style={{ display:"flex", alignItems:"flex-start", gap:10, border:`1px solid ${BLUE}33`, background:BLUE_LIGHT, borderRadius:13, padding:"12px 14px", marginBottom:14 }}>
-            <Users size={16} color={BLUE_DARK} style={{ flexShrink:0, marginTop:1 }} />
-            <div>
-              <div style={{ fontSize:12.5, fontWeight:700, color:BLUE_DARK, marginBottom:2 }}>You're marked on an active job</div>
-              <div style={{ fontSize:12, color:"#374151" }}>{j.jobSite || "Site not recorded"} · checked in by {j.checker}</div>
+          <div key={j.id} style={{ display:"flex", alignItems:"center", gap:12, background:`linear-gradient(135deg, ${BLUE}, ${BLUE_DARK})`, borderRadius:14, padding:"14px 16px", marginBottom:14, boxShadow:`0 8px 20px ${BLUE_DARK}30` }}>
+            <div style={{ width:38, height:38, borderRadius:11, background:"rgba(255,255,255,0.18)", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+              <Users size={18} color="white" />
+            </div>
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ fontSize:11, fontWeight:700, letterSpacing:0.5, color:"rgba(255,255,255,0.75)", textTransform:"uppercase", marginBottom:2 }}>You're on an active job</div>
+              <div style={{ fontSize:13.5, fontWeight:700, color:"white" }}>{j.jobSite || "Site not recorded"}</div>
+              <div style={{ fontSize:11.5, color:"rgba(255,255,255,0.8)" }}>Checked in by {j.checker}</div>
             </div>
           </div>
         ))}
 
         {/* Last fill-up status card — workers only */}
-        {isWorker && <FuelStatusCard lastFillUp={myLastFillUp} />}
+        {isWorker && <FuelStatusCard lastFillUp={myLastFillUp} fuelHistory={currentFuelHistory} />}
 
         {/* Last completed job card (workers only, when no active job) */}
         {!myActiveJob && myLastCompletedJob && isWorker && (
@@ -1329,10 +1406,16 @@ export default function AimflowMasterApp() {
           const rejected = mine.filter((e)=>e.status==="rejected").length;
           if (!pending && !approved && !rejected) return null;
           return (
-            <button onClick={()=>{setFiledTab("pending");setScreen("myFiledEntries");}} style={{ width:"100%", display:"flex", gap:8, padding:"12px 14px", borderRadius:14, border:`1px solid ${BORDER}`, background:"white", marginBottom:14, cursor:"pointer", textAlign:"left" }}>
-              {pending>0 && <span style={{ flex:1, display:"flex", alignItems:"center", gap:8, background:"#FEF0E6", borderRadius:10, padding:"9px 11px" }}><FileClock size={15} color="#C2570C" /><span><span style={{ display:"block", fontSize:13, fontWeight:800, color:"#C2570C" }}>{pending}</span><span style={{ display:"block", fontSize:9.5, fontWeight:700, color:"#92521A", letterSpacing:0.3 }}>PENDING</span></span></span>}
-              {approved>0 && <span style={{ flex:1, display:"flex", alignItems:"center", gap:8, background:GREEN_LIGHT, borderRadius:10, padding:"9px 11px" }}><CheckCircle2 size={15} color={GREEN_DARK} /><span><span style={{ display:"block", fontSize:13, fontWeight:800, color:GREEN_DARK }}>{approved}</span><span style={{ display:"block", fontSize:9.5, fontWeight:700, color:GREEN_DARK, letterSpacing:0.3 }}>APPROVED</span></span></span>}
-              {rejected>0 && <span style={{ flex:1, display:"flex", alignItems:"center", gap:8, background:RED_LIGHT, borderRadius:10, padding:"9px 11px" }}><XCircle size={15} color={RED} /><span><span style={{ display:"block", fontSize:13, fontWeight:800, color:RED }}>{rejected}</span><span style={{ display:"block", fontSize:9.5, fontWeight:700, color:RED, letterSpacing:0.3 }}>REJECTED</span></span></span>}
+            <button onClick={()=>{setFiledTab("pending");setScreen("myFiledEntries");}} style={{ width:"100%", display:"flex", flexDirection:"column", gap:8, padding:"12px 14px", borderRadius:14, border:`1px solid ${BORDER}`, background:"white", marginBottom:14, cursor:"pointer", textAlign:"left" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                <FileClock size={12} color={SLATE} />
+                <span style={{ fontSize:10.5, fontWeight:700, color:SLATE, letterSpacing:0.4, textTransform:"uppercase" }}>Your filed entries</span>
+              </div>
+              <div style={{ display:"flex", gap:8 }}>
+                {pending>0 && <span style={{ flex:1, display:"flex", alignItems:"center", gap:8, background:"#FEF0E6", borderRadius:10, padding:"9px 11px" }}><FileClock size={15} color="#C2570C" /><span><span style={{ display:"block", fontSize:13, fontWeight:800, color:"#C2570C" }}>{pending}</span><span style={{ display:"block", fontSize:9.5, fontWeight:700, color:"#92521A", letterSpacing:0.3 }}>PENDING</span></span></span>}
+                {approved>0 && <span style={{ flex:1, display:"flex", alignItems:"center", gap:8, background:GREEN_LIGHT, borderRadius:10, padding:"9px 11px" }}><CheckCircle2 size={15} color={GREEN_DARK} /><span><span style={{ display:"block", fontSize:13, fontWeight:800, color:GREEN_DARK }}>{approved}</span><span style={{ display:"block", fontSize:9.5, fontWeight:700, color:GREEN_DARK, letterSpacing:0.3 }}>APPROVED</span></span></span>}
+                {rejected>0 && <span style={{ flex:1, display:"flex", alignItems:"center", gap:8, background:RED_LIGHT, borderRadius:10, padding:"9px 11px" }}><XCircle size={15} color={RED} /><span><span style={{ display:"block", fontSize:13, fontWeight:800, color:RED }}>{rejected}</span><span style={{ display:"block", fontSize:9.5, fontWeight:700, color:RED, letterSpacing:0.3 }}>REJECTED</span></span></span>}
+              </div>
             </button>
           );
         })()}
@@ -1418,6 +1501,13 @@ export default function AimflowMasterApp() {
             {(isAdmin ? ["tanker","jetting","watertank"] : mySupTeams).map((t) => (
               <TeamLastJobCard key={t} team={t} jobHistory={jobHistory} filedEntries={filedEntries}
                 onClick={()=>{setLogTeamFilter(t);setScreen("jobLogView");}} />
+            ))}
+
+            {/* Team last-fuel cards */}
+            <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"12px 0 8px", textTransform:"uppercase", letterSpacing:0.5 }}>Last fill-up by team</div>
+            {(isAdmin ? ["tanker","jetting","watertank"] : mySupTeams).map((t) => (
+              <TeamLastFuelCard key={t} team={t} fuelHistory={fuelHistory}
+                onClick={()=>{setLogTeamFilter(t);setLogVehicleName(null);setScreen("fuelLogVehicle");}} />
             ))}
 
             {/* Team hours overview */}
@@ -1672,7 +1762,7 @@ export default function AimflowMasterApp() {
 
         {/* Step 3 — Confirm with password */}
         <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>3 · Confirm</div>
-        <input type="password" value={archivePassword} onChange={(e)=>{setArchivePassword(e.target.value);setArchiveError(null);}} placeholder="Reset password" style={inputStyle} />
+        <input id="archive-reset-password" name="reset-password" type="password" autoComplete="current-password" value={archivePassword} onChange={(e)=>{setArchivePassword(e.target.value);setArchiveError(null);}} placeholder="Reset password" style={inputStyle} />
         {archiveError && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={15} style={{ flexShrink:0 }} /><span>{archiveError}</span></div>}
         {archiveSuccess && <div style={{ display:"flex", gap:8, background:GREEN_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:GREEN_DARK }}><CheckCircle2 size={15} style={{ flexShrink:0 }} /><span>{archiveSuccess}</span></div>}
 
@@ -2633,6 +2723,7 @@ export default function AimflowMasterApp() {
     if (!recent) { setScreen("landing"); return null; }
     const cpl = recent.amount && recent.price && parseFloat(recent.amount) > 0
       ? (parseFloat(recent.price)/parseFloat(recent.amount)).toFixed(3) : null;
+    const delta = mileageDeltaFor(recent, isBeta ? betaFuelHistory : fuelHistory);
     return (
       <Shell>
         <div style={{ textAlign:"center", padding:"32px 0 20px" }}>
@@ -2653,7 +2744,7 @@ export default function AimflowMasterApp() {
               </div>
             </div>
           </div>
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", padding:"16px" }}>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", padding:"16px", paddingBottom: delta!==null ? 8 : 16 }}>
             <div style={{ borderRight:`1px solid ${BORDER}`, paddingRight:12 }}>
               <div style={{ fontSize:10, color:SLATE_LIGHT, fontWeight:700, letterSpacing:0.3, marginBottom:4, textTransform:"uppercase" }}>Litres</div>
               <div style={{ fontSize:20, fontWeight:800, color:INK }}>{parseFloat(recent.amount).toFixed(1)}</div>
@@ -2670,6 +2761,11 @@ export default function AimflowMasterApp() {
               <div style={{ fontSize:10, color:SLATE_LIGHT }}>km</div>
             </div>
           </div>
+          {delta !== null && (
+            <div style={{ margin:"0 16px 16px", background:BLUE_LIGHT, borderRadius:9, padding:"7px 11px", fontSize:11.5, fontWeight:600, color:BLUE_DARK, display:"flex", alignItems:"center", gap:5 }}>
+              <TrendingUp size={12} /> {delta.toFixed(0)} km since previous fill-up
+            </div>
+          )}
         </div>
         <PrimaryButton accent={AMBER} onClick={()=>setScreen("landing")}>Back to home</PrimaryButton>
       </Shell>
