@@ -1158,6 +1158,18 @@ export default function AimflowMasterApp() {
     window.scrollTo(0, 0);
   }, [screen]);
 
+  // When the user navigates away from the filing flow (any screen outside filedTimes →
+  // filedReview) without submitting, clear the editing reference and draft so a later
+  // unrelated submission doesn't accidentally delete the original entry being edited.
+  const FILED_FLOW_SCREENS = ["filedTimes","filedVehicle","filedSite","filedService","filedJobsheet","filedReview","filedTeam"];
+  useEffect(() => {
+    if (!FILED_FLOW_SCREENS.includes(screen)) {
+      if (editingFiledEntry) setEditingFiledEntry(null);
+      // Only clear filedDraft if we're not on a screen that legitimately uses it
+      // (avoids clearing it mid-flow on the very first render)
+    }
+  }, [screen]);
+
   // ── Transient UI state ────────────────────────────────────────────
   const [draft, setDraft] = useState(emptyDraft());
   const [checkoutDraft, setCheckoutDraft] = useState(emptyCheckout());
@@ -1169,6 +1181,7 @@ export default function AimflowMasterApp() {
   const [fuelSort, setFuelSort] = useState("date_desc");
   const [jobSearch, setJobSearch] = useState("");
   const [filedDraft, setFiledDraft] = useState(null);
+  const [editingFiledEntry, setEditingFiledEntry] = useState(null); // the original entry being edited — preserved until resubmit, so Back doesn't lose it
   const [filedTab, setFiledTab] = usePersisted("ops_filed_tab", "pending");
   const [reviewTarget, setReviewTarget] = useState(null);
   const [rejectionNote, setRejectionNote] = useState("");
@@ -1330,7 +1343,7 @@ export default function AimflowMasterApp() {
   const nowFn = () => { if(isBeta&&draft.manualCheckIn){const t=new Date(draft.manualCheckIn).getTime();if(!isNaN(t))return t;} return Date.now(); };
   const checkoutNowFn = () => { if(isBeta&&checkoutDraft.manualCheckOut){const t=new Date(checkoutDraft.manualCheckOut).getTime();if(!isNaN(t))return t;} return Date.now(); };
   const handleLogin = (user) => { lastActivityRef.current=Date.now(); setSession(user); setScreen("landing"); };
-  const handleLogout = () => { screenHistoryRef.current = []; setSession(null); setScreenRaw("landing"); setDraft(emptyDraft()); setCheckoutDraft(emptyCheckout()); setFuelDraft(emptyFuelDraft()); setLogPersonName(null); setLogVehicleName(null); setLogTeamFilter(null); };
+  const handleLogout = () => { screenHistoryRef.current = []; setSession(null); setScreenRaw("landing"); setDraft(emptyDraft()); setCheckoutDraft(emptyCheckout()); setFuelDraft(emptyFuelDraft()); setLogPersonName(null); setLogVehicleName(null); setLogTeamFilter(null); setEditingFiledEntry(null); };
 
   // ── Firestore write helpers ───────────────────────────────────────
   const fsOp = async (fn) => {
@@ -1694,7 +1707,7 @@ export default function AimflowMasterApp() {
           </span>
         </button>
 
-        <button onClick={()=>{setFiledDraft(emptyFiledDraft());setScreen("filedTeam");}} style={tileStyle()}>
+        <button onClick={()=>{setFiledDraft(emptyFiledDraft());setEditingFiledEntry(null);setScreen("filedTeam");}} style={tileStyle()}>
           <span style={{ ...tileIconStyle, background:"#FEF0E6" }}><FileClock size={22} color="#C2570C" /></span>
           <span style={{ flex:1 }}><span style={tileTitleStyle}>File a missed check-in</span><span style={tileSubStyle}>Forgot to check in or out? File for approval</span></span>
         </button>
@@ -2638,7 +2651,7 @@ export default function AimflowMasterApp() {
         {["tanker","jetting","watertank"].map((t)=>{
           const allowed = isAdminOrSup || t===session.team;
           if (!allowed) return <div key={t} style={{ ...tileStyle(), cursor:"not-allowed", opacity:0.55, background:CANVAS }}><span style={{ ...tileIconStyle, background:"white" }}><TeamIcon team={t} color={SLATE_LIGHT} /></span><span><span style={{ ...tileTitleStyle, color:SLATE }}>{teamLabel(t)} job</span><span style={{ ...tileSubStyle, color:SLATE_LIGHT, fontWeight:600 }}>Not authorised</span></span></div>;
-          return <button key={t} onClick={()=>{setFiledDraft({...emptyFiledDraft(),team:t});setScreen("filedTimes");}} style={tileStyle()}><span style={{ ...tileIconStyle, background:CANVAS }}><TeamIcon team={t} color={teamAccent(t)} /></span><span style={tileTitleStyle}>{teamLabel(t)} job</span></button>;
+          return <button key={t} onClick={()=>{setFiledDraft({...emptyFiledDraft(),team:t});setEditingFiledEntry(null);setScreen("filedTimes");}} style={tileStyle()}><span style={{ ...tileIconStyle, background:CANVAS }}><TeamIcon team={t} color={teamAccent(t)} /></span><span style={tileTitleStyle}>{teamLabel(t)} job</span></button>;
         })}
       </Shell>
     );
@@ -2869,8 +2882,10 @@ export default function AimflowMasterApp() {
         <PrimaryButton accent="#C2570C" disabled={noOneSelected} onClick={()=>{
           const entry = {
             id:`filed-${Date.now()}`, team:filedDraft.team,
-            checker: primaryPerson,         // primary name shown in lists/cards
-            filedBy: session.name,          // who actually submitted this filing
+            checker: primaryPerson,
+            // Preserve the original filedBy if editing an existing entry — don't overwrite
+            // with the editor's name. filedBy tracks who originally created this entry.
+            filedBy: editingFiledEntry ? (editingFiledEntry.filedBy || editingFiledEntry.checker) : session.name,
             jobSite:filedDraft.jobSite,
             checkInTime:new Date(filedDraft.manualCheckIn).getTime(),
             checkOutTime:new Date(filedDraft.manualCheckOut).getTime(),
@@ -2881,6 +2896,14 @@ export default function AimflowMasterApp() {
             remarks:filedDraft.remarks||"", reason:filedDraft.reason,
             status:"pending", filedAt:Date.now(), originalDraft:filedDraft,
           };
+          // Only now delete the original entry — deferred from when Edit was tapped
+          // so pressing Back before submitting doesn't lose the entry.
+          // If the original was approved, also remove its credited job record now.
+          if (editingFiledEntry) {
+            if (editingFiledEntry.status === "approved") deleteJob(`job-${editingFiledEntry.id}`);
+            deleteFiledEntry(editingFiledEntry.id);
+            setEditingFiledEntry(null);
+          }
           addFiledEntry(entry);
           setFiledDraft(null);
           setScreen("filedDone");
@@ -2936,11 +2959,10 @@ export default function AimflowMasterApp() {
         : {...emptyFiledDraft(), team:entry.team, jobSite:entry.jobSite,
            manualCheckIn:entry.checkInTime ? new Date(entry.checkInTime).toISOString().slice(0,16) : "",
            manualCheckOut:entry.checkOutTime ? new Date(entry.checkOutTime).toISOString().slice(0,16) : ""};
-      // If previously approved, undo the job credit first
-      if (entry.status==="approved") deleteJob(`job-${entry.id}`);
-      updateFiledEntry(entry.id, {status:"pending", approvedBy:null, rejectionNote:null});
+      // Do NOT delete the job credit or the entry here — defer everything to submit.
+      // If the supervisor presses Back, the entry and its credits remain intact.
       setFiledDraft(restored);
-      deleteFiledEntry(entry.id);
+      setEditingFiledEntry(entry); // store original — deleted at submit, not now
       setScreen("filedTimes");
     };
 
@@ -3011,8 +3033,7 @@ export default function AimflowMasterApp() {
     const handleEditResubmit=(entry)=>{
       const restored = entry.originalDraft ? {...entry.originalDraft,reason:entry.reason||""} : {...emptyFiledDraft(),team:entry.team,jobSite:entry.jobSite};
       setFiledDraft(restored);
-      updateFiledEntry(entry.id, {status:"withdrawn"});
-      deleteFiledEntry(entry.id);
+      setEditingFiledEntry(entry); // store original — only deleted when new entry is successfully submitted
       setScreen("filedTimes");
     };
 
