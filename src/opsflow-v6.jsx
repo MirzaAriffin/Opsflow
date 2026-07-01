@@ -201,6 +201,7 @@ const COL = {
   settings:   "settings",
   users:      "users",
   vehicles:   "vehicles",
+  services:   "services",
 };
 
 // ── useFireCollection: real-time listener for a collection ────────────
@@ -1092,6 +1093,7 @@ export default function AimflowMasterApp() {
   const [archives,      archivesLoading]= useFireCollection(COL.archives);
   const [remoteUsers,   usersLoading]   = useFireCollection(COL.users);
   const [remoteVehicles,vehiclesLoading]= useFireCollection(COL.vehicles);
+  const [remoteServices,servicesLoading]= useFireCollection(COL.services);
   const settingsDoc = useFireDoc(COL.settings, "config", null);
   const resetPassword = settingsDoc?.resetPassword || "RESET2025";
   const supervisorTeamPrefs = settingsDoc?.supervisorTeamPrefs || {};
@@ -1169,14 +1171,19 @@ export default function AimflowMasterApp() {
   const [archivePassword, setArchivePassword] = useState("");
   const [archiveRangeMode, setArchiveRangeMode] = useState("all"); // "all" | "custom"
   const [archiveTeamFilter, setArchiveTeamFilter] = useState(null); // null | "tanker" | "jetting" | "watertank"
-  const [vehicleEditTarget, setVehicleEditTarget] = useState(null); // null = adding new, else the vehicle doc being edited
+  const [vehicleEditTarget, setVehicleEditTarget] = useState(null);
   const [newVehiclePlate, setNewVehiclePlate] = useState("");
   const [newVehicleTeam, setNewVehicleTeam] = useState("tanker");
   const [vehicleDeleteTarget, setVehicleDeleteTarget] = useState(null);
+  const [serviceEditTarget, setServiceEditTarget] = useState(null);
+  const [newServiceName, setNewServiceName] = useState("");
+  const [newServiceTeam, setNewServiceTeam] = useState("tanker");
+  const [serviceDeleteTarget, setServiceDeleteTarget] = useState(null);
   const [archiveRangeStart, setArchiveRangeStart] = useState("");
   const [archiveRangeEnd, setArchiveRangeEnd] = useState("");
   const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
   const [restoreConfirmTarget, setRestoreConfirmTarget] = useState(null);
+  const [archiveDeleteTarget, setArchiveDeleteTarget] = useState(null);
   const [leaveDeleteTarget, setLeaveDeleteTarget] = useState(null);
   const [showLeavePostDeleteConfirm, setShowLeavePostDeleteConfirm] = useState(false);
   const [archiveError, setArchiveError] = useState(null);
@@ -1267,6 +1274,21 @@ export default function AimflowMasterApp() {
       batch.commit().catch(e => console.error("Seed vehicles:", e));
     }
   }, [vehiclesLoading, remoteVehicles.length]);
+
+  // ── Seed service types to Firestore on first load (from hardcoded lists + Portable Grease Trap) ──
+  useEffect(() => {
+    if (!servicesLoading && remoteServices.length === 0) {
+      const seedList = [
+        ...TANKER_SERVICING.filter(s => s !== "Others").map(name => ({ name, team: "tanker", active: true })),
+        { name: "Portable Grease Trap", team: "tanker", active: true },
+        ...JETTING_SERVICING.filter(s => s !== "Others").map(name => ({ name, team: "jetting", active: true })),
+        ...WATERTANK_SERVICING.filter(s => s !== "Others").map(name => ({ name, team: "watertank", active: true })),
+      ];
+      const batch = writeBatch(db);
+      seedList.forEach(s => batch.set(doc(collection(db, COL.services)), s));
+      batch.commit().catch(e => console.error("Seed services:", e));
+    }
+  }, [servicesLoading, remoteServices.length]);
 
   const isBeta = session?.role === "beta";
   const myActiveJobsAll = isBeta ? betaActiveJobs : activeJobs;
@@ -1406,7 +1428,22 @@ export default function AimflowMasterApp() {
   }
   const addVehicle = (plate, team) => fsOp(() => fsAdd(COL.vehicles, { plate: plate.trim(), team, active: true }));
   const updateVehicle = (id, data) => fsOp(() => fsUpdate(COL.vehicles, id, data));
-  const removeVehicle = (id) => fsOp(() => fsDelete(COL.vehicles, id)); // hard delete is fine here — vehicle plate strings on past records are just text, not a foreign key into this collection
+  const removeVehicle = (id) => fsOp(() => fsDelete(COL.vehicles, id));
+
+  // Live service types, sourced from Firestore — shadows the module-level teamServicing
+  // function for all call sites inside the component, with fallback to hardcoded lists.
+  function teamServicing(team) {
+    if (servicesLoading || remoteServices.length === 0) {
+      if (team === "jetting") return JETTING_SERVICING;
+      if (team === "watertank") return WATERTANK_SERVICING;
+      return TANKER_SERVICING;
+    }
+    const active = remoteServices.filter(s => s.team === team && s.active !== false).map(s => s.name).sort((a,b)=>a.localeCompare(b));
+    return [...active, "Others"];
+  }
+  const addService = (name, team) => fsOp(() => fsAdd(COL.services, { name: name.trim(), team, active: true }));
+  const updateService = (id, data) => fsOp(() => fsUpdate(COL.services, id, data));
+  const removeService = (id) => fsOp(() => fsDelete(COL.services, id));
 
   function checkDuplicate(team,jobSite){if(!jobSite)return false;const today=sgToday();return currentJobHistory.some(j=>{const jDate=j.checkInTime?new Date(j.checkInTime).toLocaleDateString("en-CA",{timeZone:"Asia/Singapore"}):null;return j.team===team&&j.checker===session.name&&jDate===today&&j.jobSite.toLowerCase().trim()===jobSite.toLowerCase().trim();});}
   const isAdminOrSup=session&&(session.role==="admin"||session.role==="supervisor"||session.role==="beta");
@@ -1758,6 +1795,10 @@ export default function AimflowMasterApp() {
           <span style={{ ...tileIconStyle, background:BLUE_LIGHT }}><Truck size={22} color={BLUE} /></span>
           <span style={{ flex:1 }}><span style={tileTitleStyle}>Manage vehicles</span><span style={tileSubStyle}>Add, edit, remove vehicles per team</span></span>
         </button>
+        <button onClick={()=>{setServiceEditTarget(null);setNewServiceName("");setNewServiceTeam((isAdmin?["tanker","jetting","watertank"]:mySupTeams)[0]);setScreen("adminServices");}} style={tileStyle()}>
+          <span style={{ ...tileIconStyle, background:GREEN_LIGHT }}><ClipboardList size={22} color={GREEN_DARK} /></span>
+          <span style={{ flex:1 }}><span style={tileTitleStyle}>Manage service types</span><span style={tileSubStyle}>Add, edit, remove service types per team</span></span>
+        </button>
         {isAdmin && (
           <button onClick={()=>setScreen("adminSupervisors")} style={tileStyle()}>
             <span style={{ ...tileIconStyle, background:BLUE_LIGHT }}><Users size={22} color={BLUE} /></span>
@@ -1906,8 +1947,8 @@ export default function AimflowMasterApp() {
               <button onClick={setLastMonth} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:12, fontWeight:600, cursor:"pointer" }}>Last month</button>
             </div>
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
-              <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>From</div><input type="date" value={archiveRangeStart} onChange={(e)=>setArchiveRangeStart(e.target.value)} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
-              <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>To</div><input type="date" value={archiveRangeEnd} min={archiveRangeStart} onChange={(e)=>setArchiveRangeEnd(e.target.value)} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
+              <div style={{ minWidth:0 }}><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>From</div><input type="date" value={archiveRangeStart} onChange={(e)=>setArchiveRangeStart(e.target.value)} style={{ ...datetimeInputStyle, marginBottom:0, width:"100%" }} /></div>
+              <div style={{ minWidth:0 }}><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>To</div><input type="date" value={archiveRangeEnd} min={archiveRangeStart} onChange={(e)=>setArchiveRangeEnd(e.target.value)} style={{ ...datetimeInputStyle, marginBottom:0, width:"100%" }} /></div>
             </div>
           </>
         )}
@@ -1955,6 +1996,7 @@ export default function AimflowMasterApp() {
                   <button onClick={()=>exportFuelCSV(arc.fuel)} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${AMBER}`, background:"white", color:AMBER_DARK, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><Download size={12} /> Fuel</button>
                   <button onClick={()=>exportPDF(arc.jobs,arc.fuel)} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><Download size={12} /> PDF</button>
                   <button onClick={()=>{setRestoreConfirmTarget(arc);}} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${GREEN}`, background:"white", color:GREEN_DARK, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><RotateCcw size={12} /> Restore</button>
+                  {isAdmin && <button onClick={()=>setArchiveDeleteTarget(arc)} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${RED}33`, background:RED_LIGHT, color:RED, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><Trash2 size={12} /> Delete</button>}
                 </div>
                 {restoreConfirmTarget?.id === arc.id && (
                   <ConfirmModal
@@ -1965,6 +2007,17 @@ export default function AimflowMasterApp() {
                     icon={RotateCcw}
                     onCancel={()=>setRestoreConfirmTarget(null)}
                     onConfirm={()=>{ restoreArchive(arc); setRestoreConfirmTarget(null); }}
+                  />
+                )}
+                {archiveDeleteTarget?.id === arc.id && (
+                  <ConfirmModal
+                    title={`Permanently delete "${arc.label}"?`}
+                    body={`This permanently removes this archive snapshot (${arc.jobs.length} jobs, ${arc.fuel.length} fuel records) from Opsflow. This cannot be undone — download a copy first if you need the data.`}
+                    confirmLabel="Delete archive"
+                    confirmColor={RED}
+                    icon={Trash2}
+                    onCancel={()=>setArchiveDeleteTarget(null)}
+                    onConfirm={()=>{ fsOp(()=>fsDelete(COL.archives, arc.id)); setArchiveDeleteTarget(null); }}
                   />
                 )}
               </div>
@@ -3402,9 +3455,8 @@ export default function AimflowMasterApp() {
         )}
         {isAdmin && (
           <>
-            <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Delete everything (admin only)</div>
-            <button onClick={()=>goDelete("all_live")} style={{ width:"100%", padding:14, borderRadius:12, border:`1.5px solid ${RED}`, background:"white", color:RED, fontSize:13.5, fontWeight:700, cursor:"pointer", marginBottom:8, display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}><AlertTriangle size={16} /> Delete ALL live logs (all teams)</button>
-            <button onClick={()=>goDelete("everything")} style={{ width:"100%", padding:14, borderRadius:12, border:"none", background:RED, color:"white", fontSize:13.5, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}><AlertTriangle size={16} /> Delete EVERYTHING — live + beta</button>
+            <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Delete all teams (admin only)</div>
+            <button onClick={()=>goDelete("all_live")} style={{ width:"100%", padding:14, borderRadius:12, border:`1.5px solid ${RED}`, background:"white", color:RED, fontSize:13.5, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}><AlertTriangle size={16} /> Delete all live logs (all 3 teams)</button>
           </>
         )}
       </Shell>
@@ -3808,6 +3860,92 @@ export default function AimflowMasterApp() {
     );
   }
 
+  // ── Service type management ───────────────────────────────────────
+  if (screen === "adminServices" && isTeamLead) {
+    const isAdmin = session.role === "admin";
+    const availableTeams = isAdmin ? ["tanker","jetting","watertank"] : mySupTeams;
+    const isEditing = !!serviceEditTarget;
+    const nameTrimmed = newServiceName.trim();
+    const allActiveNames = remoteServices.filter(s => s.active !== false).map(s => s.name.toLowerCase());
+    const isDuplicate = nameTrimmed && allActiveNames.includes(nameTrimmed.toLowerCase()) && (!isEditing || serviceEditTarget.name.toLowerCase() !== nameTrimmed.toLowerCase());
+    const canSave = nameTrimmed.length > 0 && !isDuplicate && availableTeams.includes(newServiceTeam);
+
+    return (
+      <Shell>
+        <Header title="Manage service types" onBack={()=>goBack("adminTools")} accent={GREEN_DARK} />
+
+        {serviceDeleteTarget && (
+          <ConfirmModal
+            title={`Remove "${serviceDeleteTarget.name}"?`}
+            body="This removes the service type from the check-in and filing pickers going forward. Past job records that used this service type are not affected."
+            confirmLabel="Remove service type"
+            onCancel={()=>setServiceDeleteTarget(null)}
+            onConfirm={()=>{ removeService(serviceDeleteTarget.id); setServiceDeleteTarget(null); }}
+          />
+        )}
+
+        {/* Add / Edit form */}
+        <div style={{ border:`1px solid ${BORDER}`, borderRadius:14, padding:"16px", marginBottom:20, background:"white" }}>
+          <div style={{ fontSize:12.5, fontWeight:700, color:INK, marginBottom:12 }}>{isEditing ? `Editing "${serviceEditTarget.name}"` : "Add a service type"}</div>
+          <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Service name</div>
+          <input value={newServiceName} onChange={(e)=>setNewServiceName(e.target.value)} placeholder="e.g. Portable Grease Trap" style={inputStyle} />
+          {isDuplicate && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={15} style={{ flexShrink:0 }} /><span>A service type with this name already exists.</span></div>}
+          <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>Team</div>
+          <div style={{ display:"flex", gap:8, marginBottom:16 }}>
+            {availableTeams.map((t) => {
+              const accent = teamAccent(t);
+              const isSel = newServiceTeam === t;
+              return (
+                <button key={t} onClick={()=>setNewServiceTeam(t)} style={{ flex:1, padding:"10px 6px", borderRadius:10, border: isSel?`1.5px solid ${accent}`:`1px solid ${BORDER}`, background: isSel?`${accent}12`:"white", color: isSel?accent:SLATE, fontSize:12, fontWeight:600, cursor:"pointer" }}>
+                  {teamLabel(t)}
+                </button>
+              );
+            })}
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            {isEditing && (
+              <button onClick={()=>{setServiceEditTarget(null);setNewServiceName("");setNewServiceTeam(availableTeams[0]);}} style={{ flex:1, padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:13.5, fontWeight:600, cursor:"pointer" }}>Cancel</button>
+            )}
+            <button onClick={()=>{
+              if (isEditing) updateService(serviceEditTarget.id, { name: nameTrimmed, team: newServiceTeam });
+              else addService(nameTrimmed, newServiceTeam);
+              setServiceEditTarget(null); setNewServiceName(""); setNewServiceTeam(availableTeams[0]);
+            }} disabled={!canSave} style={{ flex:2, padding:13, borderRadius:12, border:"none", background: canSave?GREEN_DARK:"#F0F1F4", color: canSave?"white":"#B0B4BC", fontSize:13.5, fontWeight:700, cursor: canSave?"pointer":"not-allowed", display:"flex", alignItems:"center", justifyContent:"center", gap:7 }}>
+              {isEditing ? <><Check size={15} /> Save changes</> : <><Plus size={15} /> Add service type</>}
+            </button>
+          </div>
+        </div>
+
+        {/* Service list, grouped by team */}
+        {availableTeams.map((t) => {
+          const teamServiceList = remoteServices.filter(s => s.team === t && s.active !== false).sort((a,b)=>a.name.localeCompare(b.name));
+          const accent = teamAccent(t);
+          return (
+            <div key={t} style={{ marginBottom:22 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10 }}>
+                <TeamIcon team={t} size={16} color={accent} />
+                <span style={{ fontSize:12, fontWeight:700, color:accent, textTransform:"uppercase", letterSpacing:0.4 }}>{teamLabel(t)} · {teamServiceList.length}</span>
+              </div>
+              {teamServiceList.length === 0 && (
+                <div style={{ fontSize:12.5, color:SLATE_LIGHT, fontStyle:"italic", padding:"8px 0" }}>No service types added yet for this team.</div>
+              )}
+              {teamServiceList.map((s) => (
+                <div key={s.id} style={{ display:"flex", alignItems:"center", gap:10, border:`1px solid ${BORDER}`, borderRadius:11, padding:"11px 13px", marginBottom:8, background:"white" }}>
+                  <ClipboardList size={15} color={accent} style={{ flexShrink:0 }} />
+                  <span style={{ flex:1, fontSize:13.5, fontWeight:600, color:INK }}>{s.name}</span>
+                  <button onClick={()=>{setServiceEditTarget(s);setNewServiceName(s.name);setNewServiceTeam(s.team);}} style={{ border:`1px solid ${BORDER}`, background:"white", borderRadius:8, padding:"7px 12px", fontSize:11.5, fontWeight:600, color:BLUE, cursor:"pointer" }}>Edit</button>
+                  <button onClick={()=>setServiceDeleteTarget(s)} style={{ border:`1px solid ${RED}33`, background:RED_LIGHT, borderRadius:8, padding:"7px 12px", fontSize:11.5, fontWeight:600, color:RED, cursor:"pointer" }}>Remove</button>
+                </div>
+              ))}
+            </div>
+          );
+        })}
+
+        <div style={{ fontSize:11, color:SLATE_LIGHT, textAlign:"center", marginTop:8 }}>"Others" is always available as a built-in option in every check-in screen, for service types not in this list.</div>
+      </Shell>
+    );
+  }
+
   // ════════════════════════════════════════════════════════════════════
   // LEAVE BOARD
   // ════════════════════════════════════════════════════════════════════
@@ -3918,9 +4056,6 @@ export default function AimflowMasterApp() {
             onConfirm={()=>{ deleteLeave(leaveDeleteTarget.id); setLeaveDeleteTarget(null); }}
           />
         )}
-        <PrimaryButton accent={teamAccent(leaveBoardTeam)} onClick={()=>{setLeaveDraft(emptyLeaveDraft());setLeaveEditTarget(null);setScreen("leavePost");}}>
-          <CalendarDays size={16} /> Post leave / absence
-        </PrimaryButton>
         <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"18px 0 8px", textTransform:"uppercase", letterSpacing:0.5 }}>Worker roster</div>
         {teamWorkerList.map((worker)=>{
           const workerLeave=leaveEntries.filter((e)=>e.name===worker.name).filter((e)=>{ const startTs=new Date(`${e.startDate}T00:00:00+08:00`).getTime(); return isLeaveActiveToday(e)||(startTs>todayTs&&startTs<=cutoffTs); }).sort((a,b)=>a.startDate.localeCompare(b.startDate));
@@ -3988,8 +4123,8 @@ export default function AimflowMasterApp() {
           })}
         </div>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-          <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Start date</div><input type="date" value={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,startDate:e.target.value,endDate:leaveDraft.endDate||e.target.value})} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
-          <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>End date</div><input type="date" value={leaveDraft.endDate} min={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,endDate:e.target.value})} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
+          <div style={{ minWidth:0 }}><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Start date</div><input type="date" value={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,startDate:e.target.value,endDate:leaveDraft.endDate||e.target.value})} style={{ ...datetimeInputStyle, marginBottom:0, width:"100%" }} /></div>
+          <div style={{ minWidth:0 }}><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>End date</div><input type="date" value={leaveDraft.endDate} min={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,endDate:e.target.value})} style={{ ...datetimeInputStyle, marginBottom:0, width:"100%" }} /></div>
         </div>
         {leaveDraft.startDate&&leaveDraft.endDate&&leaveDraft.startDate<=leaveDraft.endDate && <div style={{ fontSize:12, color:SLATE_LIGHT, margin:"6px 0 14px" }}>{leaveDayCount(leaveDraft.startDate,leaveDraft.endDate)} day{leaveDayCount(leaveDraft.startDate,leaveDraft.endDate)!==1?"s":""}</div>}
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Note (optional)</div>
