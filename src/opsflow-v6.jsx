@@ -690,7 +690,7 @@ function FiledStatusCard({ entry: e, isReviewer, isSelf, onApprove, onReject, on
         <div style={{ fontSize:14.5, fontWeight:700, color:INK, marginBottom:3 }}>{e.jobSite}</div>
         <div style={{ fontSize:12, color:SLATE, marginBottom:6 }}>
           For <strong>{(e.crew?.length ? e.crew : [e.checker]).join(", ")}</strong>
-          {e.filedBy && e.filedBy !== e.checker && <> · filed by {e.filedBy}</>}
+          {e.filedBy && <> · filed by {e.filedBy}</>}
           {e.checkInTime && e.checkOutTime && (
             <> · {new Date(e.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})}
             {" · "}{new Date(e.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})} – {new Date(e.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}</>
@@ -760,7 +760,7 @@ function FiledStatusCard({ entry: e, isReviewer, isSelf, onApprove, onReject, on
               </div>
             )}
             {(e.status === "approved" || e.status === "rejected") && (
-              <button onClick={() => onUndo(e)} style={{ width:"100%", padding:10, borderRadius:9, border:`1px solid ${SLATE}`, background:"white", color:SLATE, fontSize:12.5, fontWeight:700, cursor:"pointer" }}>↩ Undo</button>
+              <button onClick={() => onUndo(e)} style={{ width:"100%", padding:10, borderRadius:9, border:`1px solid ${SLATE}`, background:"white", color:SLATE, fontSize:12.5, fontWeight:700, cursor:"pointer" }}>↩ Move to pending</button>
             )}
             {/* Secondary supervisor actions — edit and delete always available */}
             <div style={{ display:"flex", gap:8 }}>
@@ -1217,6 +1217,8 @@ export default function AimflowMasterApp() {
   const [showArchiveConfirm, setShowArchiveConfirm] = useState(false);
   const [restoreConfirmTarget, setRestoreConfirmTarget] = useState(null);
   const [archiveDeleteTarget, setArchiveDeleteTarget] = useState(null);
+  const [archiveDeletePassword, setArchiveDeletePassword] = useState("");
+  const [archiveDeleteError, setArchiveDeleteError] = useState(null);
   const [leaveDeleteTarget, setLeaveDeleteTarget] = useState(null);
   const [showLeavePostDeleteConfirm, setShowLeavePostDeleteConfirm] = useState(false);
   const [withdrawConfirmTarget, setWithdrawConfirmTarget] = useState(null); // filed entry pending withdraw confirmation
@@ -2146,7 +2148,7 @@ export default function AimflowMasterApp() {
                   <button onClick={()=>exportFuelCSV(arc.fuel)} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${AMBER}`, background:"white", color:AMBER_DARK, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><Download size={12} /> Fuel</button>
                   <button onClick={()=>exportPDF(arc.jobs,arc.fuel)} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><Download size={12} /> PDF</button>
                   <button onClick={()=>{setRestoreConfirmTarget(arc);}} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${GREEN}`, background:"white", color:GREEN_DARK, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><RotateCcw size={12} /> Restore</button>
-                  {isAdmin && <button onClick={()=>setArchiveDeleteTarget(arc)} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${RED}33`, background:RED_LIGHT, color:RED, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><Trash2 size={12} /> Delete</button>}
+                  {isTeamLead && <button onClick={()=>{setArchiveDeleteTarget(arc);setArchiveDeletePassword("");setArchiveDeleteError(null);}} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${RED}33`, background:RED_LIGHT, color:RED, fontSize:12, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><Trash2 size={12} /> Delete</button>}
                 </div>
                 {restoreConfirmTarget?.id === arc.id && (
                   <ConfirmModal
@@ -2160,15 +2162,36 @@ export default function AimflowMasterApp() {
                   />
                 )}
                 {archiveDeleteTarget?.id === arc.id && (
-                  <ConfirmModal
-                    title={`Permanently delete "${arc.label}"?`}
-                    body={`This permanently removes this archive snapshot (${arc.jobs.length} jobs, ${arc.fuel.length} fuel records) from Opsflow. This cannot be undone — download a copy first if you need the data.`}
-                    confirmLabel="Delete archive"
-                    confirmColor={RED}
-                    icon={Trash2}
-                    onCancel={()=>setArchiveDeleteTarget(null)}
-                    onConfirm={()=>{ fsOp(()=>fsDelete(COL.archives, arc.id)); setArchiveDeleteTarget(null); }}
-                  />
+                  <div style={{ marginTop:12, border:`1.5px solid ${RED}`, borderRadius:12, padding:"14px", background:RED_LIGHT }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+                      <Trash2 size={15} color={RED} />
+                      <span style={{ fontSize:13, fontWeight:800, color:RED }}>Permanently delete this archive?</span>
+                    </div>
+                    <div style={{ fontSize:12, color:RED, marginBottom:12 }}>
+                      This removes {arc.jobs.length} job{arc.jobs.length===1?"":"s"} and {arc.fuel.length} fuel record{arc.fuel.length===1?"":"s"} permanently from Opsflow. This cannot be undone — download a copy first if you need the data.
+                    </div>
+                    <input
+                      type="password"
+                      autoComplete="current-password"
+                      placeholder="Enter reset password to confirm"
+                      value={archiveDeletePassword}
+                      onChange={(e)=>{setArchiveDeletePassword(e.target.value);setArchiveDeleteError(null);}}
+                      style={{ ...inputStyle, marginBottom:8 }}
+                    />
+                    {archiveDeleteError && (
+                      <div style={{ display:"flex", gap:7, background:"white", borderRadius:9, padding:"9px 11px", marginBottom:10, fontSize:12, color:RED }}>
+                        <AlertTriangle size={14} style={{ flexShrink:0 }} /><span>{archiveDeleteError}</span>
+                      </div>
+                    )}
+                    <div style={{ display:"flex", gap:8 }}>
+                      <button onClick={()=>{setArchiveDeleteTarget(null);setArchiveDeletePassword("");setArchiveDeleteError(null);}} style={{ flex:1, padding:10, borderRadius:9, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:12.5, fontWeight:600, cursor:"pointer" }}>Cancel</button>
+                      <button onClick={()=>{
+                        if (archiveDeletePassword !== resetPassword) { setArchiveDeleteError("Incorrect reset password."); return; }
+                        fsOp(()=>fsDelete(COL.archives, arc.id));
+                        setArchiveDeleteTarget(null); setArchiveDeletePassword(""); setArchiveDeleteError(null);
+                      }} style={{ flex:1, padding:10, borderRadius:9, border:"none", background:RED, color:"white", fontSize:12.5, fontWeight:700, cursor:"pointer" }}>Confirm delete</button>
+                    </div>
+                  </div>
                 )}
               </div>
             ))}
@@ -2876,7 +2899,7 @@ export default function AimflowMasterApp() {
           ["Check-out", new Date(checkOutMs).toLocaleString("en-SG",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"})],
           ["Hours", `${hours} hrs (${ot.toFixed(1)} OT each)`],
           ["Personnel credited", allCrew.join(", ")||"None selected"],
-          ["Filed by", session.name],
+          ["Filed by", editingFiledEntry ? (editingFiledEntry.filedBy || editingFiledEntry.checker) : session.name],
           ["Reason", filedDraft.reason],
         ]} />
         <PrimaryButton accent="#C2570C" disabled={noOneSelected} onClick={()=>{
