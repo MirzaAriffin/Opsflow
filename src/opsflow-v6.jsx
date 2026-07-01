@@ -1171,6 +1171,7 @@ export default function AimflowMasterApp() {
   const [archivePassword, setArchivePassword] = useState("");
   const [archiveRangeMode, setArchiveRangeMode] = useState("all"); // "all" | "custom"
   const [archiveTeamFilter, setArchiveTeamFilter] = useState(null); // null | "tanker" | "jetting" | "watertank"
+  const [archiveRecordTypes, setArchiveRecordTypes] = useState(["jobs","fuel","filed"]); // which record types to include
   const [vehicleEditTarget, setVehicleEditTarget] = useState(null);
   const [newVehiclePlate, setNewVehiclePlate] = useState("");
   const [newVehicleTeam, setNewVehicleTeam] = useState("tanker");
@@ -1371,30 +1372,31 @@ export default function AimflowMasterApp() {
   // ── Archive / reset ───────────────────────────────────────────────
   // rangeStart/rangeEnd are "YYYY-MM-DD" strings (inclusive). teamFilter is "tanker"|"jetting"|"watertank"|null (null = all teams).
   // Both filters are independent and combine: e.g. team=tanker + range=June archives only Tanker's June records.
-  async function doArchiveReset(pw, rangeStart, rangeEnd, teamFilter, label) {
+  async function doArchiveReset(pw, rangeStart, rangeEnd, teamFilter, label, recordTypes) {
     if (pw!==resetPassword){setArchiveError("Incorrect reset password.");return false;}
+    const types = recordTypes || ["jobs","fuel","filed"]; // default to all if not specified
     const startTs = rangeStart ? new Date(`${rangeStart}T00:00:00+08:00`).getTime() : -Infinity;
     const endTs = rangeEnd ? new Date(`${rangeEnd}T23:59:59+08:00`).getTime() : Infinity;
     const inRange = (ts) => ts >= startTs && ts <= endTs;
     const inTeam = (t) => !teamFilter || t === teamFilter;
 
-    const jobsInRange = jobHistory.filter(j => inRange(j.checkInTime) && inTeam(j.team));
-    const fuelInRange = fuelHistory.filter(f => inRange(f.date) && inTeam(f.team));
-    const filedInRange = filedEntries.filter(e => inRange(e.checkInTime || e.filedAt) && inTeam(e.team));
+    const jobsInRange = types.includes("jobs") ? jobHistory.filter(j => inRange(j.checkInTime) && inTeam(j.team)) : [];
+    const fuelInRange = types.includes("fuel") ? fuelHistory.filter(f => inRange(f.date) && inTeam(f.team)) : [];
+    const filedInRange = types.includes("filed") ? filedEntries.filter(e => inRange(e.checkInTime || e.filedAt) && inTeam(e.team)) : [];
 
     if (jobsInRange.length === 0 && fuelInRange.length === 0 && filedInRange.length === 0) {
-      setArchiveError("No records found for that team and date range.");
+      setArchiveError("No records found for the selected types, team and date range.");
       return false;
     }
 
     const teamPart = teamFilter ? `${teamLabel(teamFilter)} — ` : "";
+    const typePart = types.length < 3 ? `${types.map(t=>t==="jobs"?"Jobs":t==="fuel"?"Fuel":"Filed").join("+")} · ` : "";
     const finalLabel = label || (rangeStart && rangeEnd
-      ? `${teamPart}${new Date(`${rangeStart}T12:00:00+08:00`).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})} – ${new Date(`${rangeEnd}T12:00:00+08:00`).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})}`
-      : `${teamPart}${new Date().toLocaleDateString("en-SG",{month:"short",year:"numeric"})}`);
+      ? `${teamPart}${typePart}${new Date(`${rangeStart}T12:00:00+08:00`).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})} – ${new Date(`${rangeEnd}T12:00:00+08:00`).toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"})}`
+      : `${teamPart}${typePart}${new Date().toLocaleDateString("en-SG",{month:"short",year:"numeric"})}`);
 
-    const snapshot={ id:`archive-${Date.now()}`, label:finalLabel, archivedAt:Date.now(), archivedBy:session.name, rangeStart:rangeStart||null, rangeEnd:rangeEnd||null, team:teamFilter||null, jobs:jobsInRange, fuel:fuelInRange, filed:filedInRange };
+    const snapshot={ id:`archive-${Date.now()}`, label:finalLabel, archivedAt:Date.now(), archivedBy:session.name, rangeStart:rangeStart||null, rangeEnd:rangeEnd||null, team:teamFilter||null, recordTypes:types, jobs:jobsInRange, fuel:fuelInRange, filed:filedInRange };
     await fsOp(()=>fsSet(COL.archives,snapshot.id,snapshot));
-    // Only delete the records that were actually archived — anything outside the range/team stays live.
     await fsOp(async () => {
       for (const j of jobsInRange) await fsDelete(COL.jobs, j.id);
       for (const f of fuelInRange) await fsDelete(COL.fuel, f.id);
@@ -1809,7 +1811,7 @@ export default function AimflowMasterApp() {
           <span style={{ ...tileIconStyle, background:RED_LIGHT }}><AlertTriangle size={22} color={RED} /></span>
           <span style={{ flex:1 }}><span style={tileTitleStyle}>Data management</span><span style={tileSubStyle}>Delete live logs — code required</span></span>
         </button>
-        <button onClick={()=>{setArchivePassword("");setArchiveError(null);setArchiveSuccess(null);setArchiveTeamFilter(null);setArchiveRangeMode("all");setScreen("archiveTools");}} style={tileStyle()}>
+        <button onClick={()=>{setArchivePassword("");setArchiveError(null);setArchiveSuccess(null);setArchiveTeamFilter(null);setArchiveRangeMode("all");setArchiveRecordTypes(["jobs","fuel","filed"]);setScreen("archiveTools");}} style={tileStyle()}>
           <span style={{ ...tileIconStyle, background:GREEN_LIGHT }}><Archive size={22} color={GREEN_DARK} /></span>
           <span style={{ flex:1 }}><span style={tileTitleStyle}>Archive & reset</span><span style={tileSubStyle}>By team and date range — download, reset, restore</span></span>
         </button>
@@ -1872,9 +1874,16 @@ export default function AimflowMasterApp() {
     const endTs = archiveRangeEnd ? new Date(`${archiveRangeEnd}T23:59:59+08:00`).getTime() : Infinity;
     const inRange = (ts) => ts >= startTs && ts <= endTs;
     const inScope = (team) => effectiveTeams.includes(team);
-    const previewJobs = (rangeMode === "custom" ? jobHistory.filter(j => inRange(j.checkInTime)) : jobHistory).filter(j => inScope(j.team));
-    const previewFuel = (rangeMode === "custom" ? fuelHistory.filter(f => inRange(f.date)) : fuelHistory).filter(f => inScope(f.team));
+    const includeJobs = archiveRecordTypes.includes("jobs");
+    const includeFuel = archiveRecordTypes.includes("fuel");
+    const includeFiled = archiveRecordTypes.includes("filed");
+    const previewJobs = includeJobs ? (rangeMode === "custom" ? jobHistory.filter(j => inRange(j.checkInTime)) : jobHistory).filter(j => inScope(j.team)) : [];
+    const previewFuel = includeFuel ? (rangeMode === "custom" ? fuelHistory.filter(f => inRange(f.date)) : fuelHistory).filter(f => inScope(f.team)) : [];
     const rangeValid = rangeMode === "all" || (archiveRangeStart && archiveRangeEnd && archiveRangeStart <= archiveRangeEnd);
+
+    const toggleRecordType = (type) => {
+      setArchiveRecordTypes(prev => prev.includes(type) ? prev.filter(t => t !== type) : [...prev, type]);
+    };
 
     const setThisMonth = () => {
       const now = new Date();
@@ -1905,7 +1914,7 @@ export default function AimflowMasterApp() {
             onCancel={()=>setShowArchiveConfirm(false)}
             onConfirm={async()=>{
               setShowArchiveConfirm(false);
-              await doArchiveReset(archivePassword, rangeMode==="custom"?archiveRangeStart:null, rangeMode==="custom"?archiveRangeEnd:null, teamFilter);
+              await doArchiveReset(archivePassword, rangeMode==="custom"?archiveRangeStart:null, rangeMode==="custom"?archiveRangeEnd:null, teamFilter, null, archiveRecordTypes);
             }}
           />
         )}
@@ -1933,8 +1942,29 @@ export default function AimflowMasterApp() {
           })}
         </div>
 
-        {/* Step 2 — Date scope */}
-        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>2 · Date range</div>
+        {/* Step 2 — Record types */}
+        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>2 · What to include</div>
+        <div style={{ display:"flex", flexDirection:"column", gap:8, marginBottom:20 }}>
+          {[
+            { key:"jobs", label:"Job logs", count: jobHistory.filter(j=>inScope(j.team)).length },
+            { key:"fuel", label:"Fuel records", count: fuelHistory.filter(f=>inScope(f.team)).length },
+            { key:"filed", label:"Filed entries", count: filedEntries.filter(e=>inScope(e.team)).length },
+          ].map(({ key, label, count }) => {
+            const selected = archiveRecordTypes.includes(key);
+            return (
+              <button key={key} onClick={()=>toggleRecordType(key)} style={{ display:"flex", alignItems:"center", gap:10, padding:"12px 14px", borderRadius:12, border: selected?`1.5px solid ${GREEN_DARK}`:`1px solid ${BORDER}`, background: selected?GREEN_LIGHT:"white", textAlign:"left", cursor:"pointer" }}>
+                <div style={{ width:20, height:20, borderRadius:6, border: selected?`2px solid ${GREEN_DARK}`:`2px solid ${BORDER}`, background: selected?GREEN_DARK:"white", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                  {selected && <Check size={12} color="white" strokeWidth={3} />}
+                </div>
+                <span style={{ flex:1, fontSize:13.5, fontWeight:600, color:selected?GREEN_DARK:INK }}>{label}</span>
+                <span style={{ fontSize:11.5, color:selected?GREEN_DARK:SLATE_LIGHT, fontWeight:600 }}>{count} records</span>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Step 3 — Date scope */}
+        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>3 · Date range</div>
         <div style={{ display:"flex", gap:8, marginBottom:14 }}>
           <button onClick={()=>setArchiveRangeMode("all")} style={{ flex:1, padding:"11px 8px", borderRadius:11, border: rangeMode==="all"?`1.5px solid ${GREEN_DARK}`:`1px solid ${BORDER}`, background: rangeMode==="all"?GREEN_LIGHT:"white", color: rangeMode==="all"?GREEN_DARK:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Everything live</button>
           <button onClick={()=>setArchiveRangeMode("custom")} style={{ flex:1, padding:"11px 8px", borderRadius:11, border: rangeMode==="custom"?`1.5px solid ${GREEN_DARK}`:`1px solid ${BORDER}`, background: rangeMode==="custom"?GREEN_LIGHT:"white", color: rangeMode==="custom"?GREEN_DARK:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Custom range</button>
@@ -1946,9 +1976,9 @@ export default function AimflowMasterApp() {
               <button onClick={setThisMonth} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:12, fontWeight:600, cursor:"pointer" }}>This month</button>
               <button onClick={setLastMonth} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:12, fontWeight:600, cursor:"pointer" }}>Last month</button>
             </div>
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
-              <div style={{ minWidth:0 }}><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>From</div><input type="date" value={archiveRangeStart} onChange={(e)=>setArchiveRangeStart(e.target.value)} style={{ ...datetimeInputStyle, marginBottom:0, width:"100%" }} /></div>
-              <div style={{ minWidth:0 }}><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>To</div><input type="date" value={archiveRangeEnd} min={archiveRangeStart} onChange={(e)=>setArchiveRangeEnd(e.target.value)} style={{ ...datetimeInputStyle, marginBottom:0, width:"100%" }} /></div>
+            <div style={{ display:"flex", flexDirection:"column", gap:10, marginBottom:14 }}>
+              <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>From</div><input type="date" value={archiveRangeStart} onChange={(e)=>setArchiveRangeStart(e.target.value)} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
+              <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>To</div><input type="date" value={archiveRangeEnd} min={archiveRangeStart} onChange={(e)=>setArchiveRangeEnd(e.target.value)} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
             </div>
           </>
         )}
@@ -1960,8 +1990,8 @@ export default function AimflowMasterApp() {
           <div style={{ fontSize:12.5, color:"#374151", marginTop:2 }}>{previewJobs.length} job{previewJobs.length===1?"":"s"} · {previewFuel.length} fuel record{previewFuel.length===1?"":"s"}</div>
         </div>
 
-        {/* Step 3 — Confirm with password */}
-        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>3 · Confirm</div>
+        {/* Step 4 — Confirm with password */}
+        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>4 · Confirm</div>
         <input id="archive-reset-password" name="reset-password" type="password" autoComplete="current-password" value={archivePassword} onChange={(e)=>{setArchivePassword(e.target.value);setArchiveError(null);}} placeholder="Reset password" style={inputStyle} />
         {archiveError && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={15} style={{ flexShrink:0 }} /><span>{archiveError}</span></div>}
         {archiveSuccess && <div style={{ display:"flex", gap:8, background:GREEN_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:GREEN_DARK }}><CheckCircle2 size={15} style={{ flexShrink:0 }} /><span>{archiveSuccess}</span></div>}
@@ -1972,7 +2002,7 @@ export default function AimflowMasterApp() {
           <button onClick={()=>exportPDF(previewJobs,previewFuel)} style={{ flex:1, padding:12, borderRadius:12, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:13, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Download size={14} /> PDF</button>
         </div>
 
-        <PrimaryButton accent={GREEN_DARK} disabled={!archivePassword.trim() || !rangeValid || previewJobs.length+previewFuel.length===0} onClick={()=>setShowArchiveConfirm(true)}>
+        <PrimaryButton accent={GREEN_DARK} disabled={!archivePassword.trim() || !rangeValid || archiveRecordTypes.length===0 || previewJobs.length+previewFuel.length===0} onClick={()=>setShowArchiveConfirm(true)}>
           <Archive size={16} /> Archive & Reset {scopeLabel}
         </PrimaryButton>
 
@@ -3447,10 +3477,31 @@ export default function AimflowMasterApp() {
         </select>
         {dataToolsTeam && (
           <div style={{ marginBottom:24 }}>
-            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10 }}><TeamIcon team={dataToolsTeam} size={16} color={teamAccent(dataToolsTeam)} /><div style={{ fontSize:13, fontWeight:700, color:INK }}>{teamLabel(dataToolsTeam)} team</div></div>
-            <button onClick={()=>!jobsEmpty&&goDelete(`jobs:${dataToolsTeam}`)} disabled={jobsEmpty} style={rowBtnStyle(jobsEmpty)}><span style={{ fontSize:13.5, fontWeight:600, color:INK }}>Job logs</span><span style={{ fontSize:11, color:RED, fontWeight:600 }}>{selectedCounts.jobs} records</span></button>
-            <button onClick={()=>!fuelEmpty&&goDelete(`fuelteam:${dataToolsTeam}`)} disabled={fuelEmpty} style={rowBtnStyle(fuelEmpty)}><span style={{ fontSize:13.5, fontWeight:600, color:INK }}>Vehicle (fuel) logs</span><span style={{ fontSize:11, color:RED, fontWeight:600 }}>{selectedCounts.fuel} records</span></button>
-            <button onClick={()=>!allEmpty&&goDelete(dataToolsTeam)} disabled={allEmpty} style={{ ...rowBtnStyle(allEmpty), background:allEmpty?"white":RED_LIGHT, marginBottom:0 }}><span style={{ fontSize:13.5, fontWeight:700, color:RED }}>All {teamLabel(dataToolsTeam)} logs</span><AlertTriangle size={14} color={RED} /></button>
+            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10 }}>
+              <TeamIcon team={dataToolsTeam} size={16} color={teamAccent(dataToolsTeam)} />
+              <div style={{ fontSize:13, fontWeight:700, color:INK }}>{teamLabel(dataToolsTeam)} team</div>
+            </div>
+            <button onClick={()=>!jobsEmpty&&goDelete(`jobs:${dataToolsTeam}`)} disabled={jobsEmpty} style={{ width:"100%", display:"flex", alignItems:"center", justifyContent:"space-between", padding:"13px 15px", borderRadius:11, border:`1.5px solid ${jobsEmpty?BORDER:RED}`, background:jobsEmpty?"white":RED_LIGHT, marginBottom:8, cursor:jobsEmpty?"not-allowed":"pointer", opacity:jobsEmpty?0.45:1 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <Trash2 size={14} color={jobsEmpty?SLATE_LIGHT:RED} />
+                <span style={{ fontSize:13.5, fontWeight:700, color:jobsEmpty?SLATE:RED }}>Delete {teamLabel(dataToolsTeam)} job logs</span>
+              </div>
+              <span style={{ fontSize:11, color:jobsEmpty?SLATE_LIGHT:RED, fontWeight:600 }}>{selectedCounts.jobs} records</span>
+            </button>
+            <button onClick={()=>!fuelEmpty&&goDelete(`fuelteam:${dataToolsTeam}`)} disabled={fuelEmpty} style={{ width:"100%", display:"flex", alignItems:"center", justifyContent:"space-between", padding:"13px 15px", borderRadius:11, border:`1.5px solid ${fuelEmpty?BORDER:RED}`, background:fuelEmpty?"white":RED_LIGHT, marginBottom:8, cursor:fuelEmpty?"not-allowed":"pointer", opacity:fuelEmpty?0.45:1 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <Trash2 size={14} color={fuelEmpty?SLATE_LIGHT:RED} />
+                <span style={{ fontSize:13.5, fontWeight:700, color:fuelEmpty?SLATE:RED }}>Delete {teamLabel(dataToolsTeam)} fuel logs</span>
+              </div>
+              <span style={{ fontSize:11, color:fuelEmpty?SLATE_LIGHT:RED, fontWeight:600 }}>{selectedCounts.fuel} records</span>
+            </button>
+            <button onClick={()=>!allEmpty&&goDelete(dataToolsTeam)} disabled={allEmpty} style={{ width:"100%", display:"flex", alignItems:"center", justifyContent:"space-between", padding:"13px 15px", borderRadius:11, border:`1.5px solid ${allEmpty?BORDER:RED}`, background:allEmpty?"white":RED, marginBottom:0, cursor:allEmpty?"not-allowed":"pointer", opacity:allEmpty?0.45:1 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <Trash2 size={14} color={allEmpty?SLATE_LIGHT:"white"} />
+                <span style={{ fontSize:13.5, fontWeight:700, color:allEmpty?SLATE:"white" }}>Delete all {teamLabel(dataToolsTeam)} logs</span>
+              </div>
+              <span style={{ fontSize:11, color:allEmpty?SLATE_LIGHT:"rgba(255,255,255,0.75)", fontWeight:600 }}>{(selectedCounts.jobs+selectedCounts.fuel)} records total</span>
+            </button>
           </div>
         )}
         {isAdmin && (
@@ -4122,9 +4173,9 @@ export default function AimflowMasterApp() {
             </button>;
           })}
         </div>
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-          <div style={{ minWidth:0 }}><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Start date</div><input type="date" value={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,startDate:e.target.value,endDate:leaveDraft.endDate||e.target.value})} style={{ ...datetimeInputStyle, marginBottom:0, width:"100%" }} /></div>
-          <div style={{ minWidth:0 }}><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>End date</div><input type="date" value={leaveDraft.endDate} min={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,endDate:e.target.value})} style={{ ...datetimeInputStyle, marginBottom:0, width:"100%" }} /></div>
+        <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+          <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Start date</div><input type="date" value={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,startDate:e.target.value,endDate:leaveDraft.endDate||e.target.value})} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
+          <div><div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>End date</div><input type="date" value={leaveDraft.endDate} min={leaveDraft.startDate} onChange={(e)=>setLeaveDraft({...leaveDraft,endDate:e.target.value})} style={{ ...datetimeInputStyle, marginBottom:0 }} /></div>
         </div>
         {leaveDraft.startDate&&leaveDraft.endDate&&leaveDraft.startDate<=leaveDraft.endDate && <div style={{ fontSize:12, color:SLATE_LIGHT, margin:"6px 0 14px" }}>{leaveDayCount(leaveDraft.startDate,leaveDraft.endDate)} day{leaveDayCount(leaveDraft.startDate,leaveDraft.endDate)!==1?"s":""}</div>}
         <div style={{ fontSize:12, color:SLATE, marginBottom:6, fontWeight:600 }}>Note (optional)</div>
