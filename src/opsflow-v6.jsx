@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   MapPin, CheckCircle2, AlertCircle, ChevronLeft,
-  LogIn, LogOut, Check, Plus, Fuel, Camera, ClipboardList,
+  LogIn, LogOut, Check, Plus, Fuel, Camera, ClipboardList, ChevronRight,
   Lock, ShieldAlert, KeyRound, Users, AlertTriangle, Truck, Building2,
   Clock, TrendingUp, Calendar, Waves, Droplet, FileClock, XCircle,
   MessageSquare, Edit3, UserPlus, Trash2, Pencil, CalendarDays, BedDouble,
@@ -135,11 +135,13 @@ function roundOT(v) { return Math.round(v*10)/10; }
 function calcOT(cin,cout) { const dt=getDayType(cin),hrs=(cout-cin)/3600000; if(isPremiumDay(dt))return roundOT(hrs); const {dateStr}=sgDateParts(cin),isSat=dt==="Saturday",endH=isSat?12:17,dayEnd=new Date(`${dateStr}T${String(endH).padStart(2,"0")}:30:00+08:00`).getTime(),dayStart=new Date(`${dateStr}T08:30:00+08:00`).getTime(); let ot=0; if(cin<dayStart)ot+=Math.min(cout,dayStart)-cin; if(cout>dayEnd)ot+=cout-Math.max(cin,dayEnd); return roundOT(Math.max(0,ot)/3600000); }
 
 // ── Per-person job credit ─────────────────────────────────────────────
-// Every person on a job (checker + crew) individually earns the job's full hours and OT.
-// "Team total OT" = sum of every individual's OT credit, i.e. headcount × per-job OT.
+// Credit goes ONLY to people explicitly selected as crew during check-in.
+// The checker field records who submitted the check-in — not a claim that
+// they were physically on site. If the checker selected themselves in the
+// crew picker, their name will appear in job.crew and they'll be credited
+// that way. If they didn't select themselves, they don't get credited.
 function jobCreditedPeople(job) {
   const people = new Set();
-  if (job.checker) people.add(job.checker);
   (job.crew || []).forEach((name) => { if (name) people.add(name); });
   return [...people];
 }
@@ -662,8 +664,8 @@ function FiledTabs({ entries, active, onChange }) {
   );
 }
 
-function FiledStatusCard({ entry: e, isReviewer, onApprove, onReject, onUndo, onWithdraw, onAmend }) {
-  const [expanded, setExpanded] = React.useState(isReviewer); // auto-expand for reviewers
+function FiledStatusCard({ entry: e, isReviewer, isSelf, onApprove, onReject, onUndo, onWithdraw, onEditResubmit, onAmend, onEdit, onDelete }) {
+  const [expanded, setExpanded] = React.useState(isReviewer);
   const accent = { pending:"#C2570C", approved:GREEN_DARK, rejected:RED }[e.status] || SLATE;
   const bg = { pending:"#FEF0E6", approved:GREEN_LIGHT, rejected:RED_LIGHT }[e.status] || CANVAS;
   const hoursNum = parseFloat(e.hours || 0);
@@ -707,21 +709,16 @@ function FiledStatusCard({ entry: e, isReviewer, onApprove, onReject, onUndo, on
 
         {expanded && (
           <div style={{ borderTop:`1px solid ${BORDER}`, paddingTop:10, marginTop:2 }}>
-            {/* Reason */}
             {e.reason && (
               <div style={{ background:"#FEF0E6", borderRadius:8, padding:"8px 11px", marginBottom:10, fontSize:12, color:"#7C3D08" }}>
                 <strong>Reason filed:</strong> {e.reason}
               </div>
             )}
-
-            {/* Vehicles — crew already shown in the always-visible summary above, no need to repeat it here */}
             {e.vehicles?.length > 0 && (
               <div style={{ marginBottom:10, fontSize:11, color:SLATE }}>
                 <strong>Vehicles:</strong> {e.vehicles.join(", ")}
               </div>
             )}
-
-            {/* Services */}
             {serviceSummary.length > 0 && (
               <div style={{ marginBottom:10 }}>
                 <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:5, textTransform:"uppercase", letterSpacing:0.3 }}>Services</div>
@@ -730,16 +727,12 @@ function FiledStatusCard({ entry: e, isReviewer, onApprove, onReject, onUndo, on
                 ))}
               </div>
             )}
-
-            {/* Jobsheet / PUB */}
             {(e.jobsheet || e.pubDisposal) && (
               <div style={{ marginBottom:10 }}>
                 {e.jobsheet && <div style={{ fontSize:11, color:SLATE, marginBottom:3 }}><strong>Jobsheet:</strong> {e.jobsheet}</div>}
                 {e.pubDisposal && <div style={{ fontSize:11, color:SLATE }}><strong>PUB disposal:</strong> {e.pubDisposal}</div>}
               </div>
             )}
-
-            {/* Remarks */}
             {e.remarks && (
               <div style={{ fontSize:11, color:SLATE, marginBottom:10, fontStyle:"italic" }}>Remarks: "{e.remarks}"</div>
             )}
@@ -758,21 +751,47 @@ function FiledStatusCard({ entry: e, isReviewer, onApprove, onReject, onUndo, on
 
         {/* Action buttons */}
         {isReviewer ? (
-          <div style={{ display:"flex", gap:8, marginTop:8 }}>
+          <div style={{ display:"flex", flexDirection:"column", gap:8, marginTop:8 }}>
+            {/* Primary reviewer actions */}
             {e.status === "pending" && (
-              <>
+              <div style={{ display:"flex", gap:8 }}>
                 <button onClick={() => onApprove(e)} style={{ flex:1, padding:10, borderRadius:9, border:"none", background:GREEN_DARK, color:"white", fontSize:12.5, fontWeight:700, cursor:"pointer" }}>✓ Approve</button>
                 <button onClick={() => onReject(e)} style={{ flex:1, padding:10, borderRadius:9, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:12.5, fontWeight:700, cursor:"pointer" }}>✕ Reject</button>
-              </>
+              </div>
             )}
             {(e.status === "approved" || e.status === "rejected") && (
-              <button onClick={() => onUndo(e)} style={{ flex:1, padding:10, borderRadius:9, border:`1px solid ${SLATE}`, background:"white", color:SLATE, fontSize:12.5, fontWeight:700, cursor:"pointer" }}>↩ Undo</button>
+              <button onClick={() => onUndo(e)} style={{ width:"100%", padding:10, borderRadius:9, border:`1px solid ${SLATE}`, background:"white", color:SLATE, fontSize:12.5, fontWeight:700, cursor:"pointer" }}>↩ Undo</button>
             )}
+            {/* Secondary supervisor actions — edit and delete always available */}
+            <div style={{ display:"flex", gap:8 }}>
+              <button onClick={() => onEdit(e)} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${BLUE}`, background:"white", color:BLUE, fontSize:12, fontWeight:600, cursor:"pointer" }}>
+                ✏ Edit{e.status === "approved" ? " (resets to pending)" : ""}
+              </button>
+              <button onClick={() => onDelete(e)} style={{ flex:1, padding:9, borderRadius:9, border:`1px solid ${RED}`, background:RED_LIGHT, color:RED, fontSize:12, fontWeight:600, cursor:"pointer" }}>
+                🗑 Delete{e.status === "approved" ? " (removes hours)" : ""}
+              </button>
+            </div>
           </div>
         ) : (
-          <div style={{ display:"flex", gap:8, marginTop:8 }}>
-            {e.status === "pending" && <button onClick={() => onWithdraw(e)} style={{ flex:1, padding:10, borderRadius:9, border:`1px solid ${SLATE}`, background:"white", color:SLATE, fontSize:12.5, fontWeight:600, cursor:"pointer" }}>Withdraw</button>}
-            {e.status === "rejected" && <button onClick={() => onAmend(e)} style={{ flex:1, padding:10, borderRadius:9, border:"none", background:AMBER, color:"white", fontSize:12.5, fontWeight:700, cursor:"pointer" }}>✏ Amend & Resubmit</button>}
+          <div style={{ display:"flex", flexDirection:"column", gap:8, marginTop:8 }}>
+            {/* Pending — two separate actions */}
+            {e.status === "pending" && (
+              <div style={{ display:"flex", gap:8 }}>
+                <button onClick={() => onEditResubmit(e)} style={{ flex:2, padding:10, borderRadius:9, border:"none", background:BLUE, color:"white", fontSize:12.5, fontWeight:700, cursor:"pointer" }}>✏ Edit & resubmit</button>
+                <button onClick={() => onWithdraw(e)} style={{ flex:1, padding:10, borderRadius:9, border:`1px solid ${SLATE}`, background:"white", color:SLATE, fontSize:12, fontWeight:600, cursor:"pointer" }}>Withdraw</button>
+              </div>
+            )}
+            {/* Rejected — amend or delete */}
+            {e.status === "rejected" && (
+              <div style={{ display:"flex", gap:8 }}>
+                <button onClick={() => onAmend(e)} style={{ flex:2, padding:10, borderRadius:9, border:"none", background:AMBER, color:"white", fontSize:12.5, fontWeight:700, cursor:"pointer" }}>✏ Amend & Resubmit</button>
+                <button onClick={() => onDelete(e)} style={{ flex:1, padding:10, borderRadius:9, border:`1px solid ${RED}`, background:RED_LIGHT, color:RED, fontSize:12, fontWeight:600, cursor:"pointer" }}>Delete</button>
+              </div>
+            )}
+            {/* Approved — no self-service */}
+            {e.status === "approved" && (
+              <div style={{ fontSize:11, color:SLATE_LIGHT, fontStyle:"italic", marginTop:4 }}>Hours have been credited — contact your supervisor to make changes.</div>
+            )}
           </div>
         )}
       </div>
@@ -1171,7 +1190,7 @@ export default function AimflowMasterApp() {
   const [archivePassword, setArchivePassword] = useState("");
   const [archiveRangeMode, setArchiveRangeMode] = useState("all"); // "all" | "custom"
   const [archiveTeamFilter, setArchiveTeamFilter] = useState(null); // null | "tanker" | "jetting" | "watertank"
-  const [archiveRecordTypes, setArchiveRecordTypes] = useState(["jobs","fuel","filed"]); // which record types to include
+  const [archiveRecordTypes, setArchiveRecordTypes] = useState(["jobs","fuel"]); // filed entries implicit with jobs
   const [vehicleEditTarget, setVehicleEditTarget] = useState(null);
   const [newVehiclePlate, setNewVehiclePlate] = useState("");
   const [newVehicleTeam, setNewVehicleTeam] = useState("tanker");
@@ -1187,6 +1206,8 @@ export default function AimflowMasterApp() {
   const [archiveDeleteTarget, setArchiveDeleteTarget] = useState(null);
   const [leaveDeleteTarget, setLeaveDeleteTarget] = useState(null);
   const [showLeavePostDeleteConfirm, setShowLeavePostDeleteConfirm] = useState(false);
+  const [withdrawConfirmTarget, setWithdrawConfirmTarget] = useState(null); // filed entry pending withdraw confirmation
+  const [filedDeleteTarget, setFiledDeleteTarget] = useState(null); // filed entry pending delete confirmation (supervisor or worker on rejected)
   const [archiveError, setArchiveError] = useState(null);
   const [archiveSuccess, setArchiveSuccess] = useState(null);
   const [newResetPw, setNewResetPw] = useState("");
@@ -1302,6 +1323,9 @@ export default function AimflowMasterApp() {
   const myLastCompletedJob = session ? [...currentJobHistory].filter(j => j.checker===session.name||(j.crew||[]).includes(session.name)).sort((a,b)=>b.checkOutTime-a.checkOutTime)[0]||null : null;
   const myLastFillUp = session ? [...currentFuelHistory].filter(f=>f.person===session.name).sort((a,b)=>b.date-a.date)[0]||null : null;
   const elapsed = useElapsed(myActiveJob ? myActiveJob.checkInTime : null);
+  // Shared ticking clock for supervisor live job cards — updates every minute
+  const [tickNow, setTickNow] = useState(Date.now());
+  useEffect(() => { const id = setInterval(() => setTickNow(Date.now()), 60000); return () => clearInterval(id); }, []);
 
   const nowFn = () => { if(isBeta&&draft.manualCheckIn){const t=new Date(draft.manualCheckIn).getTime();if(!isNaN(t))return t;} return Date.now(); };
   const checkoutNowFn = () => { if(isBeta&&checkoutDraft.manualCheckOut){const t=new Date(checkoutDraft.manualCheckOut).getTime();if(!isNaN(t))return t;} return Date.now(); };
@@ -1694,6 +1718,59 @@ export default function AimflowMasterApp() {
               </span>
             </button>
 
+            {/* Live team job status — ongoing jobs across assigned teams */}
+            {(() => {
+              const teamScope = isAdmin ? ["tanker","jetting","watertank"] : mySupTeams;
+              const ongoingJobs = myActiveJobsAll.filter(j => teamScope.includes(j.team));
+              if (ongoingJobs.length === 0) return null;
+              return (
+                <>
+                  <SectionLabel accent={GREEN_DARK}>Ongoing jobs</SectionLabel>
+                  {ongoingJobs.map((j) => {
+                    const accent = teamAccent(j.team);
+                    const elapsedMs = tickNow - j.checkInTime;
+                    const totalMin = Math.floor(elapsedMs / 60000);
+                    const h = Math.floor(totalMin / 60), m = totalMin % 60;
+                    const elapsedStr = h > 0 ? `${h}h ${m}m` : `${m}m`;
+                    const crew = [...new Set(j.crew || [])];
+                    return (
+                      <div key={j.checker} style={{ border:`1.5px solid ${accent}44`, borderRadius:13, marginBottom:10, overflow:"hidden", background:"white" }}>
+                        {/* Team header */}
+                        <div style={{ background:`${accent}12`, padding:"8px 13px", display:"flex", alignItems:"center", gap:7, borderBottom:`1px solid ${accent}22` }}>
+                          <TeamIcon team={j.team} size={13} color={accent} />
+                          <span style={{ fontSize:11.5, fontWeight:700, color:accent }}>{teamLabel(j.team)} team</span>
+                          <span style={{ marginLeft:"auto", fontSize:11, fontWeight:700, color:"white", background:GREEN_DARK, borderRadius:20, padding:"2px 9px" }}>LIVE · {elapsedStr}</span>
+                        </div>
+                        {/* Job details */}
+                        <div style={{ padding:"11px 13px" }}>
+                          <div style={{ fontSize:14, fontWeight:700, color:INK, marginBottom:4 }}>{j.jobSite}</div>
+                          <div style={{ fontSize:11.5, color:SLATE, marginBottom:6 }}>
+                            Checked in {new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})} · by {j.checker}
+                          </div>
+                          {/* Personnel */}
+                          {crew.length > 0 && (
+                            <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:6 }}>
+                              {crew.map((name) => (
+                                <span key={name} style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:20, background:BLUE_LIGHT, color:BLUE }}>{name}</span>
+                              ))}
+                            </div>
+                          )}
+                          {/* Vehicles */}
+                          {(j.vehicles||[]).length > 0 && (
+                            <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                              {(j.vehicles||[]).map((v) => (
+                                <span key={v} style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:20, background:CANVAS, color:SLATE }}>{v}</span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </>
+              );
+            })()}
+
             {/* Team last-job cards */}
             <SectionLabel accent={GREEN_DARK}>Last completed job by team</SectionLabel>
             {(isAdmin ? ["tanker","jetting","watertank"] : mySupTeams).map((t) => (
@@ -1811,7 +1888,7 @@ export default function AimflowMasterApp() {
           <span style={{ ...tileIconStyle, background:RED_LIGHT }}><AlertTriangle size={22} color={RED} /></span>
           <span style={{ flex:1 }}><span style={tileTitleStyle}>Data management</span><span style={tileSubStyle}>Delete live logs — code required</span></span>
         </button>
-        <button onClick={()=>{setArchivePassword("");setArchiveError(null);setArchiveSuccess(null);setArchiveTeamFilter(null);setArchiveRangeMode("all");setArchiveRecordTypes(["jobs","fuel","filed"]);setScreen("archiveTools");}} style={tileStyle()}>
+        <button onClick={()=>{setArchivePassword("");setArchiveError(null);setArchiveSuccess(null);setArchiveTeamFilter(null);setArchiveRangeMode("all");setArchiveRecordTypes(["jobs","fuel"]);setScreen("archiveTools");}} style={tileStyle()}>
           <span style={{ ...tileIconStyle, background:GREEN_LIGHT }}><Archive size={22} color={GREEN_DARK} /></span>
           <span style={{ flex:1 }}><span style={tileTitleStyle}>Archive & reset</span><span style={tileSubStyle}>By team and date range — download, reset, restore</span></span>
         </button>
@@ -1876,10 +1953,17 @@ export default function AimflowMasterApp() {
     const inScope = (team) => effectiveTeams.includes(team);
     const includeJobs = archiveRecordTypes.includes("jobs");
     const includeFuel = archiveRecordTypes.includes("fuel");
-    const includeFiled = archiveRecordTypes.includes("filed");
+    // Filed entries always travel with job logs — no independent toggle
+    const includeFiled = includeJobs;
     const previewJobs = includeJobs ? (rangeMode === "custom" ? jobHistory.filter(j => inRange(j.checkInTime)) : jobHistory).filter(j => inScope(j.team)) : [];
     const previewFuel = includeFuel ? (rangeMode === "custom" ? fuelHistory.filter(f => inRange(f.date)) : fuelHistory).filter(f => inScope(f.team)) : [];
     const rangeValid = rangeMode === "all" || (archiveRangeStart && archiveRangeEnd && archiveRangeStart <= archiveRangeEnd);
+
+    // Hard block: if job logs are included, check for pending filed entries in the same scope
+    const pendingInScope = includeJobs ? filedEntries.filter(e =>
+      e.status === "pending" && inScope(e.team) && inRange(e.checkInTime || e.filedAt)
+    ) : [];
+    const isBlocked = pendingInScope.length > 0;
 
     const toggleRecordType = (type) => {
       setArchiveRecordTypes(prev => prev.includes(type) ? prev.filter(t => t !== type) : [...prev, type]);
@@ -1944,11 +2028,10 @@ export default function AimflowMasterApp() {
 
         {/* Step 2 — Record types */}
         <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>2 · What to include</div>
-        <div style={{ display:"flex", flexDirection:"column", gap:8, marginBottom:20 }}>
+        <div style={{ display:"flex", flexDirection:"column", gap:8, marginBottom:8 }}>
           {[
             { key:"jobs", label:"Job logs", count: jobHistory.filter(j=>inScope(j.team)).length },
             { key:"fuel", label:"Fuel records", count: fuelHistory.filter(f=>inScope(f.team)).length },
-            { key:"filed", label:"Filed entries", count: filedEntries.filter(e=>inScope(e.team)).length },
           ].map(({ key, label, count }) => {
             const selected = archiveRecordTypes.includes(key);
             return (
@@ -1962,6 +2045,7 @@ export default function AimflowMasterApp() {
             );
           })}
         </div>
+        <div style={{ fontSize:11, color:SLATE_LIGHT, fontStyle:"italic", marginBottom:20 }}>Filed entries always travel with job logs — no separate switch. If any are still pending in this scope, archiving is blocked below.</div>
 
         {/* Step 3 — Date scope */}
         <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>3 · Date range</div>
@@ -1990,9 +2074,32 @@ export default function AimflowMasterApp() {
           <div style={{ fontSize:12.5, color:"#374151", marginTop:2 }}>{previewJobs.length} job{previewJobs.length===1?"":"s"} · {previewFuel.length} fuel record{previewFuel.length===1?"":"s"}</div>
         </div>
 
+        {/* Pending filed entries hard block */}
+        {isBlocked && (
+          <div style={{ border:`1.5px solid ${AMBER}`, background:AMBER_LIGHT, borderRadius:13, padding:"14px", marginBottom:20 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+              <AlertTriangle size={16} color={AMBER_DARK} />
+              <span style={{ fontSize:13.5, fontWeight:800, color:AMBER_DARK }}>Archiving blocked</span>
+            </div>
+            <div style={{ fontSize:12.5, color:AMBER_DARK, marginBottom:12 }}>
+              {pendingInScope.length} pending filed {pendingInScope.length===1?"entry needs":"entries need"} approval or rejection before you can archive job logs in this scope.
+            </div>
+            {pendingInScope.map((e) => (
+              <button key={e.id} onClick={()=>{setFiledTab("pending");setScreen("reviewQueue");}} style={{ width:"100%", display:"flex", alignItems:"center", justifyContent:"space-between", padding:"10px 12px", borderRadius:10, border:`1px solid ${AMBER}55`, background:"white", marginBottom:8, cursor:"pointer", textAlign:"left" }}>
+                <div>
+                  <div style={{ fontSize:12.5, fontWeight:700, color:INK }}>{e.filedBy || e.checker} · {teamLabel(e.team)} · {e.checkInTime ? new Date(e.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"}) : "—"}</div>
+                  {e.reason && <div style={{ fontSize:11.5, color:SLATE, marginTop:2 }}>{e.reason}</div>}
+                </div>
+                <ChevronRight size={14} color={SLATE_LIGHT} style={{ flexShrink:0, marginLeft:8 }} />
+              </button>
+            ))}
+            <div style={{ fontSize:11, color:AMBER_DARK, fontStyle:"italic", marginTop:4 }}>Tap an entry to open Review filed entries — see full job details before approving or rejecting.</div>
+          </div>
+        )}
+
         {/* Step 4 — Confirm with password */}
         <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>4 · Confirm</div>
-        <input id="archive-reset-password" name="reset-password" type="password" autoComplete="current-password" value={archivePassword} onChange={(e)=>{setArchivePassword(e.target.value);setArchiveError(null);}} placeholder="Reset password" style={inputStyle} />
+        <input id="archive-reset-password" name="reset-password" type="password" autoComplete="current-password" disabled={isBlocked} value={archivePassword} onChange={(e)=>{setArchivePassword(e.target.value);setArchiveError(null);}} placeholder={isBlocked?"Clear pending entries above first":"Reset password"} style={{ ...inputStyle, opacity:isBlocked?0.45:1 }} />
         {archiveError && <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}><AlertTriangle size={15} style={{ flexShrink:0 }} /><span>{archiveError}</span></div>}
         {archiveSuccess && <div style={{ display:"flex", gap:8, background:GREEN_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:GREEN_DARK }}><CheckCircle2 size={15} style={{ flexShrink:0 }} /><span>{archiveSuccess}</span></div>}
 
@@ -2002,7 +2109,7 @@ export default function AimflowMasterApp() {
           <button onClick={()=>exportPDF(previewJobs,previewFuel)} style={{ flex:1, padding:12, borderRadius:12, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:13, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Download size={14} /> PDF</button>
         </div>
 
-        <PrimaryButton accent={GREEN_DARK} disabled={!archivePassword.trim() || !rangeValid || archiveRecordTypes.length===0 || previewJobs.length+previewFuel.length===0} onClick={()=>setShowArchiveConfirm(true)}>
+        <PrimaryButton accent={GREEN_DARK} disabled={isBlocked || !archivePassword.trim() || !rangeValid || archiveRecordTypes.length===0 || previewJobs.length+previewFuel.length===0} onClick={()=>setShowArchiveConfirm(true)}>
           <Archive size={16} /> Archive & Reset {scopeLabel}
         </PrimaryButton>
 
@@ -2821,12 +2928,58 @@ export default function AimflowMasterApp() {
       if (entry.status==="approved") deleteJob(`job-${entry.id}`);
       updateFiledEntry(entry.id, {status:"pending",approvedBy:null,rejectionNote:null});
     };
+
+    // Supervisor edit: pull entry back into the filing draft flow, reset to pending on resubmit
+    const handleEdit=(entry)=>{
+      const restored = entry.originalDraft
+        ? {...entry.originalDraft, reason:entry.reason||""}
+        : {...emptyFiledDraft(), team:entry.team, jobSite:entry.jobSite,
+           manualCheckIn:entry.checkInTime ? new Date(entry.checkInTime).toISOString().slice(0,16) : "",
+           manualCheckOut:entry.checkOutTime ? new Date(entry.checkOutTime).toISOString().slice(0,16) : ""};
+      // If previously approved, undo the job credit first
+      if (entry.status==="approved") deleteJob(`job-${entry.id}`);
+      updateFiledEntry(entry.id, {status:"pending", approvedBy:null, rejectionNote:null});
+      setFiledDraft(restored);
+      deleteFiledEntry(entry.id);
+      setScreen("filedTimes");
+    };
+
+    // Supervisor delete
+    const handleDeleteRequest=(entry)=>setFiledDeleteTarget(entry);
+    const handleDeleteConfirm=()=>{
+      if (filedDeleteTarget.status==="approved") deleteJob(`job-${filedDeleteTarget.id}`);
+      deleteFiledEntry(filedDeleteTarget.id);
+      setFiledDeleteTarget(null);
+    };
+
     return (
       <Shell>
-        <Header title="Review filed entries" onBack={()=>goBack("landing")} accent="#C2570C" />
+        <Header title="Review filed entries" onBack={()=>goBack()} accent="#C2570C" />
+
+        {/* Delete confirmation */}
+        {filedDeleteTarget && (
+          <ConfirmModal
+            title={filedDeleteTarget.status==="approved" ? "Delete approved entry?" : "Delete this filed entry?"}
+            body={filedDeleteTarget.status==="approved"
+              ? `"${filedDeleteTarget.jobSite}" will be permanently deleted and the credited hours for ${(filedDeleteTarget.crew||[]).join(", ")} will be removed.`
+              : `"${filedDeleteTarget.jobSite}" will be permanently deleted.`}
+            confirmLabel="Delete"
+            confirmColor={RED}
+            icon={Trash2}
+            onCancel={()=>setFiledDeleteTarget(null)}
+            onConfirm={handleDeleteConfirm}
+          />
+        )}
+
         <FiledTabs entries={scoped} active={filedTab} onChange={setFiledTab} />
         {list.length===0 && <div style={{ textAlign:"center", color:SLATE_LIGHT, fontSize:13, padding:"30px 0" }}>Nothing here yet</div>}
-        {list.map((e)=><FiledStatusCard key={e.id} entry={e} isReviewer onApprove={handleApprove} onReject={handleReject} onUndo={handleUndo} />)}
+        {list.map((e)=><FiledStatusCard key={e.id} entry={e} isReviewer
+          onApprove={handleApprove}
+          onReject={handleReject}
+          onUndo={handleUndo}
+          onEdit={handleEdit}
+          onDelete={handleDeleteRequest}
+        />)}
       </Shell>
     );
   }
@@ -2853,18 +3006,68 @@ export default function AimflowMasterApp() {
   if (screen === "myFiledEntries") {
     const mine = filedEntries.filter((e)=>(e.filedBy===session.name||e.checker===session.name||(e.crew||[]).includes(session.name)));
     const list = mine.filter((e)=>e.status===filedTab);
-    const handleWithdraw=(entry)=>deleteFiledEntry(entry.id);
+
+    // "Edit & resubmit" on pending: pull back to draft, pre-fill, return to filing flow
+    const handleEditResubmit=(entry)=>{
+      const restored = entry.originalDraft ? {...entry.originalDraft,reason:entry.reason||""} : {...emptyFiledDraft(),team:entry.team,jobSite:entry.jobSite};
+      setFiledDraft(restored);
+      updateFiledEntry(entry.id, {status:"withdrawn"});
+      deleteFiledEntry(entry.id);
+      setScreen("filedTimes");
+    };
+
+    // "Withdraw" on pending: show confirmation first
+    const handleWithdrawRequest=(entry)=>setWithdrawConfirmTarget(entry);
+    const handleWithdrawConfirm=()=>{ deleteFiledEntry(withdrawConfirmTarget.id); setWithdrawConfirmTarget(null); };
+
+    // "Amend & Resubmit" on rejected: same as before
     const handleAmend=(entry)=>{
       const restored = entry.originalDraft ? {...entry.originalDraft,reason:""} : {...emptyFiledDraft(),team:entry.team,jobSite:entry.jobSite};
       setFiledDraft(restored);
       deleteFiledEntry(entry.id); setScreen("filedTimes");
     };
+
+    // "Delete" on rejected: show confirmation
+    const handleDeleteRequest=(entry)=>setFiledDeleteTarget(entry);
+    const handleDeleteConfirm=()=>{ deleteFiledEntry(filedDeleteTarget.id); setFiledDeleteTarget(null); };
+
     return (
       <Shell>
         <Header title="My filed entries" onBack={()=>goBack("myJobLog")} accent="#C2570C" />
+
+        {/* Withdraw confirmation */}
+        {withdrawConfirmTarget && (
+          <ConfirmModal
+            title="Withdraw this entry?"
+            body={`"${withdrawConfirmTarget.jobSite}" will be permanently removed. This cannot be undone.`}
+            confirmLabel="Withdraw"
+            confirmColor={SLATE}
+            onCancel={()=>setWithdrawConfirmTarget(null)}
+            onConfirm={handleWithdrawConfirm}
+          />
+        )}
+
+        {/* Delete confirmation (rejected entries) */}
+        {filedDeleteTarget && filedDeleteTarget.status === "rejected" && (
+          <ConfirmModal
+            title="Delete this entry?"
+            body={`"${filedDeleteTarget.jobSite}" will be permanently deleted. No hours were credited since it was rejected.`}
+            confirmLabel="Delete"
+            confirmColor={RED}
+            icon={Trash2}
+            onCancel={()=>setFiledDeleteTarget(null)}
+            onConfirm={handleDeleteConfirm}
+          />
+        )}
+
         <FiledTabs entries={mine} active={filedTab} onChange={setFiledTab} />
         {list.length===0 && <div style={{ textAlign:"center", color:SLATE_LIGHT, fontSize:13, padding:"30px 0" }}>Nothing here yet</div>}
-        {list.map((e)=><FiledStatusCard key={e.id} entry={e} isReviewer={false} onWithdraw={handleWithdraw} onAmend={handleAmend} />)}
+        {list.map((e)=><FiledStatusCard key={e.id} entry={e} isReviewer={false}
+          onEditResubmit={handleEditResubmit}
+          onWithdraw={handleWithdrawRequest}
+          onAmend={handleAmend}
+          onDelete={handleDeleteRequest}
+        />)}
       </Shell>
     );
   }
@@ -3153,7 +3356,7 @@ export default function AimflowMasterApp() {
         {teamJobs.length===0 && <div style={{ textAlign:"center", color:SLATE_LIGHT, fontSize:13, padding:"24px 0" }}>No results</div>}
         {teamJobs.map((j,i)=>{
           const dayType=getDayType(j.checkInTime); const ot=calcOT(j.checkInTime,j.checkOutTime); const premium=isPremiumDay(dayType);
-          const allPeople=[...new Set([j.checker,...(j.crew||[])])];
+          const allPeople=[...new Set(j.crew||[])];
           const isLongEntry=parseFloat(j.hours||0)>12;
           return (
             <div key={j.id||i} style={{ border:isLongEntry?`1.5px solid ${AMBER}`:j.wasFiledEntry?`1.5px solid #C2570C55`:`1px solid ${BORDER}`, borderRadius:13, padding:15, marginBottom:10, background:isLongEntry?AMBER_LIGHT:j.wasFiledEntry?"#FFFBF7":"white" }}>
