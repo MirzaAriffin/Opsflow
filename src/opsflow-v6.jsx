@@ -1025,7 +1025,7 @@ function GapIndicator({ gapMs, isTravelling }) {
 }
 
 // Shift container header — Day or Night
-function ShiftHeader({ shift, showOT, otVisible, isAdminOrSup, onMergeRequest, onSplitRequest }) {
+function ShiftHeader({ shift, showOT, otVisible, isAdminOrSup, onMergeAbove, onMergeBelow, onSplitRequest }) {
   const isNight = shift.isNight;
   const accent = isNight ? "#1E1B4B" : BLUE;
   const bg = isNight ? "#1E1B4B0A" : BLUE_LIGHT;
@@ -1061,17 +1061,20 @@ function ShiftHeader({ shift, showOT, otVisible, isAdminOrSup, onMergeRequest, o
         </div>
       </div>
       {isAdminOrSup && (
-        <div style={{ display:"flex", gap:6 }}>
-          {onMergeRequest && (
-            <button onClick={onMergeRequest} style={{ flex:1, padding:"6px 10px", borderRadius:8, border:`1px solid ${accent}44`, background:"white", color:accent, fontSize:11, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
-              Merge with next
+        <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+          {onMergeAbove && (
+            <button onClick={onMergeAbove} style={{ flex:1, padding:"6px 10px", borderRadius:8, border:`1px solid ${accent}44`, background:"white", color:accent, fontSize:11, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}>
+              ↑ Merge with run above
+            </button>
+          )}
+          {onMergeBelow && (
+            <button onClick={onMergeBelow} style={{ flex:1, padding:"6px 10px", borderRadius:8, border:`1px solid ${accent}44`, background:"white", color:accent, fontSize:11, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}>
+              ↓ Merge with run below
             </button>
           )}
           {shift.jobs.length > 1 && onSplitRequest && (
-            <button onClick={onSplitRequest} style={{ flex:1, padding:"6px 10px", borderRadius:8, border:`1px solid ${accent}44`, background:"white", color:accent, fontSize:11, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
-              Split run
+            <button onClick={()=>onSplitRequest()} style={{ flex:1, padding:"6px 10px", borderRadius:8, border:`1px solid ${accent}44`, background:"white", color:accent, fontSize:11, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}>
+              ✂ Split run
             </button>
           )}
           {shift.isOverride && (
@@ -1089,7 +1092,7 @@ function ShiftHeader({ shift, showOT, otVisible, isAdminOrSup, onMergeRequest, o
 // personName: whose shifts to group by (null = group all jobs by date/time proximity)
 // renderJob: function(job, index) => JSX — the individual job card renderer
 // session, isAdminOrSup: for OT visibility gating
-function ShiftGroupedJobList({ jobs, personName, renderJob, session, isAdminOrSup, showOT = true, onUpdateJob }) {
+function ShiftGroupedJobList({ jobs, personName, renderJob, session, isAdminOrSup, showOT = true, onUpdateJob, sortDir = "desc" }) {
   if (!jobs || jobs.length === 0) return null;
 
   const jobsForGrouping = personName
@@ -1097,7 +1100,10 @@ function ShiftGroupedJobList({ jobs, personName, renderJob, session, isAdminOrSu
     : jobs;
 
   const shifts = groupJobsIntoShifts(jobsForGrouping);
-  const sortedShifts = [...shifts].sort((a, b) => b.shiftIn - a.shiftIn);
+  // Respect sort direction — desc = newest first (default), asc = oldest first
+  const sortedShifts = [...shifts].sort((a, b) =>
+    sortDir === "asc" ? a.shiftIn - b.shiftIn : b.shiftIn - a.shiftIn
+  );
   const otVisible = personName ? canSeeOT(session, personName) : isAdminOrSup;
 
   // Merge: combine this shift with the chronologically adjacent shift
@@ -1124,8 +1130,8 @@ function ShiftGroupedJobList({ jobs, personName, renderJob, session, isAdminOrSu
   return (
     <>
       {sortedShifts.map((shift, si) => {
-        // Find the chronologically adjacent shift for merge (the one immediately before or after)
-        const adjacentShift = sortedShifts[si + 1] || null; // next oldest shift
+        const shiftAbove = si > 0 ? sortedShifts[si - 1] : null; // newer shift (above in display)
+        const shiftBelow = sortedShifts[si + 1] || null; // older shift (below in display)
         return (
           <div key={si} style={{ marginBottom:16 }}>
             <ShiftHeader
@@ -1133,7 +1139,8 @@ function ShiftGroupedJobList({ jobs, personName, renderJob, session, isAdminOrSu
               showOT={showOT}
               otVisible={otVisible}
               isAdminOrSup={isAdminOrSup && !!onUpdateJob}
-              onMergeRequest={adjacentShift ? () => handleMerge(shift, adjacentShift) : null}
+              onMergeAbove={shiftAbove ? () => handleMerge(shift, shiftAbove) : null}
+              onMergeBelow={shiftBelow ? () => handleMerge(shift, shiftBelow) : null}
               onSplitRequest={shift.jobs.length > 1 ? (mode) => handleSplit(shift, mode) : null}
             />
             <div style={{ border:`1.5px solid ${shift.isNight ? "#1E1B4B33" : `${BLUE}33`}`, borderTop:"none", borderRadius:"0 0 12px 12px", overflow:"hidden" }}>
@@ -1551,6 +1558,7 @@ export default function AimflowMasterApp() {
       case "adminAddUser": return newUserDraft !== null;
       case "adminPinEdit": return !!pinEditTarget;
       case "leavePost": return leaveDraft !== null;
+      case "personnelLogDetail": return !!logPersonName;
       default: return true; // screens with no draft/target requirement are always valid
     }
   }, [filedDraft, reviewTarget, fuelDraft, editTarget, editDraft, entryDeleteTarget, deleteTarget, newUserDraft, pinEditTarget, leaveDraft]);
@@ -3710,6 +3718,7 @@ export default function AimflowMasterApp() {
           jobs={teamJobs}
           personName={null}
           showOT={false}
+          sortDir={jobSort === "date_asc" ? "asc" : "desc"}
           session={session}
           isAdminOrSup={isAdminOrSup}
           onUpdateJob={isAdminOrSup ? (id, data) => updateJob(id, data) : null}
@@ -3768,60 +3777,62 @@ export default function AimflowMasterApp() {
     const pickableNames = canPickAnyone
       ? userDirectory.filter((u)=>u.role==="worker"||u.role==="supervisor").map((u)=>u.name).sort((a,b)=>a.localeCompare(b))
       : userDirectory.filter((u)=>u.role==="worker"&&u.team===session.team).map((u)=>u.name).sort((a,b)=>a.localeCompare(b));
+    return (
+      <Shell>
+        <Header title="Personnel log" onBack={()=>goBack(isWorker?"landing":"logsHome")} accent={PURPLE} />
+        <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>{canPickAnyone?"Select a person to view their log":"Select a teammate to view their log"}</div>
+        <PickList label="Select one" options={pickableNames} selected={null} multi={false} accent={PURPLE} onToggle={(val)=>{setLogPersonName(val);setScreen("personnelLogDetail");}} />
+      </Shell>
+    );
+  }
+
+  if (screen === "personnelLogDetail") {
     const involvedTarget = logPersonName || session.name;
     let myJobs = [...currentJobHistory.filter((j)=>jobCreditedPeople(j).includes(involvedTarget))].sort((a,b)=>b.checkInTime-a.checkInTime);
     const totals = personTotals(currentJobHistory, involvedTarget);
     const otVisible = canSeeOT(session,involvedTarget);
     return (
       <Shell>
-        <Header title="Personnel log" onBack={()=>goBack(isWorker?"landing":"logsHome")} accent={PURPLE} />
-
-        <div style={{ fontSize:11, fontWeight:700, color:SLATE, marginBottom:8, textTransform:"uppercase", letterSpacing:0.5 }}>Individual logs</div>
-        <div style={{ fontSize:12, color:SLATE, marginBottom:8, fontWeight:600 }}>{canPickAnyone?"Select a person":"Select a teammate"}</div>
-        <PickList label="Select one" options={pickableNames} selected={logPersonName} multi={false} accent={PURPLE} onToggle={(val)=>setLogPersonName(val)} />
-        {logPersonName && (
-          <>
-            <div style={{ display:"flex", gap:10, marginBottom:14 }}>
-              <div style={{ flex:1, background:"white", border:`1px solid ${BORDER}`, borderRadius:13, padding:"13px 14px" }}>
-                <div style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3, marginBottom:4 }}>TOTAL HOURS</div>
-                <div style={{ fontSize:19, fontWeight:800, color:INK }}>{totals.hours.toFixed(1)}</div>
+        <Header title={involvedTarget} onBack={()=>goBack("personnelLog")} accent={PURPLE} />
+        <div style={{ display:"flex", gap:10, marginBottom:14 }}>
+          <div style={{ flex:1, background:"white", border:`1px solid ${BORDER}`, borderRadius:13, padding:"13px 14px" }}>
+            <div style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3, marginBottom:4 }}>TOTAL HOURS</div>
+            <div style={{ fontSize:19, fontWeight:800, color:INK }}>{totals.hours.toFixed(1)}</div>
+          </div>
+          <div style={{ flex:1, background:otVisible?"white":CANVAS, border:`1px solid ${BORDER}`, borderRadius:13, padding:"13px 14px" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:4 }}>{!otVisible&&<Lock size={11} color={SLATE_LIGHT} />}<div style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3 }}>TENTATIVE OT</div></div>
+            {otVisible?<div style={{ fontSize:19, fontWeight:800, color:INK }}>{totals.ot.toFixed(1)}</div>:<div style={{ fontSize:12.5, fontWeight:700, color:SLATE_LIGHT, marginTop:2 }}>Not authorised</div>}
+          </div>
+        </div>
+        {myJobs.length===0 && <div style={{ textAlign:"center", color:SLATE_LIGHT, fontSize:13, padding:"24px 0" }}>No job history yet</div>}
+        <ShiftGroupedJobList
+          jobs={myJobs}
+          personName={involvedTarget}
+          session={session}
+          isAdminOrSup={isAdminOrSup}
+          renderJob={(j) => {
+            const dayType=getDayType(j.checkInTime); const ot=calcOT(j.checkInTime,j.checkOutTime); const premium=isPremiumDay(dayType);
+            return (
+              <div>
+                <div style={{ display:"flex", gap:6, marginBottom:8, flexWrap:"wrap" }}>
+                  <span style={{ fontSize:11, fontWeight:700, padding:"3px 9px", borderRadius:7, background:CANVAS, color:"#374151", display:"inline-flex", alignItems:"center", gap:5 }}><TeamIcon team={j.team} size={12} color={teamAccent(j.team)} /> {teamLabel(j.team)}</span>
+                  <span style={{ fontSize:11, color:premium?RED:SLATE_LIGHT, fontWeight:premium?700:400, marginLeft:"auto" }}>{dayType}</span>
+                </div>
+                <div style={{ fontSize:14.5, fontWeight:700, color:INK, marginBottom:2 }}>{j.jobSite}</div>
+                <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
+                  {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
+                  {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+                  {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+                  {j.checker!==involvedTarget&&` · checked in by ${j.checker}`}
+                </div>
+                <div style={{ display:"flex", gap:6 }}>
+                  <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{j.hours} hrs</span>
+                  {otVisible?(ot>0&&<span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:premium?RED_LIGHT:GREEN_LIGHT, color:premium?RED:GREEN_DARK }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span>):<span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:SLATE_LIGHT, display:"flex", alignItems:"center", gap:4 }}><Lock size={10} /> OT hidden</span>}
+                </div>
               </div>
-              <div style={{ flex:1, background:otVisible?"white":CANVAS, border:`1px solid ${BORDER}`, borderRadius:13, padding:"13px 14px" }}>
-                <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:4 }}>{!otVisible&&<Lock size={11} color={SLATE_LIGHT} />}<div style={{ fontSize:10.5, color:SLATE, fontWeight:700, letterSpacing:0.3 }}>TENTATIVE OT</div></div>
-                {otVisible?<div style={{ fontSize:19, fontWeight:800, color:INK }}>{totals.ot.toFixed(1)}</div>:<div style={{ fontSize:12.5, fontWeight:700, color:SLATE_LIGHT, marginTop:2 }}>Not authorised</div>}
-              </div>
-            </div>
-            {myJobs.length===0 && <div style={{ textAlign:"center", color:SLATE_LIGHT, fontSize:13, padding:"24px 0" }}>No job history yet</div>}
-            <ShiftGroupedJobList
-              jobs={myJobs}
-              personName={involvedTarget}
-              session={session}
-              isAdminOrSup={isAdminOrSup}
-              renderJob={(j) => {
-                const dayType=getDayType(j.checkInTime); const ot=calcOT(j.checkInTime,j.checkOutTime); const premium=isPremiumDay(dayType);
-                return (
-                  <div>
-                    <div style={{ display:"flex", gap:6, marginBottom:8, flexWrap:"wrap" }}>
-                      <span style={{ fontSize:11, fontWeight:700, padding:"3px 9px", borderRadius:7, background:CANVAS, color:"#374151", display:"inline-flex", alignItems:"center", gap:5 }}><TeamIcon team={j.team} size={12} color={teamAccent(j.team)} /> {teamLabel(j.team)}</span>
-                      <span style={{ fontSize:11, color:premium?RED:SLATE_LIGHT, fontWeight:premium?700:400, marginLeft:"auto" }}>{dayType}</span>
-                    </div>
-                    <div style={{ fontSize:14.5, fontWeight:700, color:INK, marginBottom:2 }}>{j.jobSite}</div>
-                    <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
-                      {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
-                      {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
-                      {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
-                      {j.checker!==involvedTarget&&` · checked in by ${j.checker}`}
-                    </div>
-                    <div style={{ display:"flex", gap:6 }}>
-                      <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{j.hours} hrs</span>
-                      {otVisible?(ot>0&&<span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:premium?RED_LIGHT:GREEN_LIGHT, color:premium?RED:GREEN_DARK }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span>):<span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:SLATE_LIGHT, display:"flex", alignItems:"center", gap:4 }}><Lock size={10} /> OT hidden</span>}
-                    </div>
-                  </div>
-                );
-              }}
-            />
-          </>
-        )}
+            );
+          }}
+        />
       </Shell>
     );
   }
