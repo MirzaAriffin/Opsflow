@@ -134,6 +134,141 @@ function isPremiumDay(dt) { return dt==="Sunday"||dt==="Public Holiday"; }
 function roundOT(v) { return Math.round(v*10)/10; }
 function calcOT(cin,cout) { const dt=getDayType(cin),hrs=(cout-cin)/3600000; if(isPremiumDay(dt))return roundOT(hrs); const {dateStr}=sgDateParts(cin),isSat=dt==="Saturday",endH=isSat?12:17,dayEnd=new Date(`${dateStr}T${String(endH).padStart(2,"0")}:30:00+08:00`).getTime(),dayStart=new Date(`${dateStr}T08:30:00+08:00`).getTime(); let ot=0; if(cin<dayStart)ot+=Math.min(cout,dayStart)-cin; if(cout>dayEnd)ot+=cout-Math.max(cin,dayEnd); return roundOT(Math.max(0,ot)/3600000); }
 
+// ── Shift-based OT constants ──────────────────────────────────────────
+// OT starts at 5:30 PM (17:30) on weekdays, 12:30 PM on Saturdays.
+// Jobs after 5:30 PM within SHIFT_GAP_MS of each other = same night run.
+// Day jobs are always separate from night jobs regardless of gap.
+const SHIFT_GAP_MS = 1.5 * 60 * 60 * 1000; // 1.5 hours in ms
+
+// Returns the 5:30 PM cutoff timestamp (in ms) for the date of a given check-in.
+function getOtCutoff(cin) {
+  const {dateStr} = sgDateParts(cin);
+  const dt = getDayType(cin);
+  const isSat = dt === "Saturday";
+  const endH = isSat ? 12 : 17;
+  return new Date(`${dateStr}T${String(endH).padStart(2,"0")}:30:00+08:00`).getTime();
+}
+
+// Is this job a "night" job? True if check-in is at or after the OT cutoff (5:30 PM),
+// OR if check-in is before 8:30 AM (jobs starting between midnight and morning are
+// part of a night shift that started the previous evening — no legitimate day job
+// starts before 8:30 AM in this operation).
+function isNightJob(job) {
+  if (!job.checkInTime || !job.checkOutTime) return false;
+  const ts = job.checkInTime;
+  const dt = getDayType(ts);
+  if (isPremiumDay(dt)) return true;
+  // Get Singapore hour for the midnight-to-morning check
+  const sgHourStr = new Date(ts).toLocaleTimeString("en-SG", {timeZone:"Asia/Singapore", hour:"2-digit", minute:"2-digit", hour12:false});
+  const [h, m] = sgHourStr.split(":").map(Number);
+  // Before 8:30 AM = part of a night shift
+  if (h < 8 || (h === 8 && m < 30)) return true;
+  // At or after 5:30 PM = night job
+  return ts >= getOtCutoff(ts);
+}
+
+// Group a list of jobs (already filtered to a specific person) into shifts.
+// Returns an array of shift objects: { jobs, shiftIn, shiftOut, otHours, totalHours, isNight }
+// Rules:
+//   - Jobs are sorted by checkInTime
+//   - Day jobs (before OT cutoff) and night jobs (after OT cutoff) are always separate
+//   - Night jobs within SHIFT_GAP_MS of each other = same shift (travel time counts as OT)
+//   - Day jobs are grouped by calendar date (same date = same day container, always)
+//   - Overlapping jobs within a shift are merged into one continuous span
+function groupJobsIntoShifts(jobs) {
+  if (!jobs || jobs.length === 0) return [];
+
+  const sorted = [...jobs]
+    .filter(j => j.checkInTime && j.checkOutTime)
+    .sort((a, b) => a.checkInTime - b.checkInTime);
+
+  if (sorted.length === 0) return [];
+
+  // First pass: group jobs that share an explicit shiftGroup override
+  // Jobs with the same shiftGroup ID are always in the same shift regardless of gap/time
+  const overrideGroups = {};
+  const noOverride = [];
+  for (const job of sorted) {
+    if (job.shiftGroup) {
+      if (!overrideGroups[job.shiftGroup]) overrideGroups[job.shiftGroup] = [];
+      overrideGroups[job.shiftGroup].push(job);
+    } else {
+      noOverride.push(job);
+    }
+  }
+
+  // Convert override groups into shift objects directly
+  const overrideShifts = Object.values(overrideGroups).map(groupJobs => {
+    const sortedGroup = [...groupJobs].sort((a,b) => a.checkInTime - b.checkInTime);
+    // Night if any job in the group is a night job
+    const isNight = sortedGroup.some(j => isNightJob(j));
+    const {dateStr} = sgDateParts(sortedGroup[0].checkInTime);
+    return { jobs: sortedGroup, isNight, dateStr, isOverride: true };
+  });
+
+  // Second pass: auto-group remaining jobs by threshold
+  const autoShifts = [];
+  let current = null;
+  for (const job of noOverride) {
+    const night = isNightJob(job);
+    const {dateStr} = sgDateParts(job.checkInTime);
+    if (!current) {
+      current = { jobs: [job], isNight: night, dateStr };
+    } else {
+      const lastJob = current.jobs[current.jobs.length - 1];
+      const gap = job.checkInTime - lastJob.checkOutTime;
+      const sameNight = night && current.isNight;
+      const sameDay = !night && !current.isNight && dateStr === current.dateStr;
+      if (sameNight && gap <= SHIFT_GAP_MS) {
+        current.jobs.push(job);
+      } else if (sameDay) {
+        current.jobs.push(job);
+      } else {
+        autoShifts.push(current);
+        current = { jobs: [job], isNight: night, dateStr };
+      }
+    }
+  }
+  if (current) autoShifts.push(current);
+
+  // Combine override and auto shifts, then compute spans and OT for all
+  const allShifts = [...overrideShifts, ...autoShifts];
+
+  return allShifts.map(shift => {
+    const spans = shift.jobs.map(j => ({ in: j.checkInTime, out: j.checkOutTime }));
+    spans.sort((a, b) => a.in - b.in);
+    const merged = [];
+    for (const span of spans) {
+      if (merged.length === 0 || span.in > merged[merged.length-1].out) {
+        merged.push({...span});
+      } else {
+        merged[merged.length-1].out = Math.max(merged[merged.length-1].out, span.out);
+      }
+    }
+    const shiftIn = merged[0].in;
+    const shiftOut = merged[merged.length-1].out;
+    let otHours = 0;
+    if (shift.isNight) {
+      otHours = calcOT(shiftIn, shiftOut);
+    } else {
+      for (const j of shift.jobs) otHours += calcOT(j.checkInTime, j.checkOutTime);
+      otHours = roundOT(otHours);
+    }
+    const totalHours = roundOT(shift.jobs.reduce((sum, j) =>
+      sum + (j.checkOutTime - j.checkInTime) / 3600000, 0));
+    return {
+      jobs: shift.jobs,
+      shiftIn,
+      shiftOut,
+      otHours,
+      totalHours,
+      isNight: shift.isNight,
+      dateStr: shift.dateStr,
+      isOverride: !!shift.isOverride,
+    };
+  });
+}
+
 // ── Per-person job credit ─────────────────────────────────────────────
 // Credit goes ONLY to people explicitly selected as crew during check-in.
 // The checker field records who submitted the check-in — not a claim that
@@ -146,25 +281,31 @@ function jobCreditedPeople(job) {
   return [...people];
 }
 
-// Sum hours/OT credited to ONE specific person across a list of jobs (their personal total).
+// Sum hours/OT credited to ONE specific person across a list of jobs.
+// Uses shift-based OT: jobs are grouped into shifts first, then OT is
+// calculated on the full shift span (including travel gaps between sites).
+// This correctly credits travel time between sites as OT on night runs.
 function personTotals(jobs, personName) {
-  return jobs.reduce((acc, j) => {
-    if (jobCreditedPeople(j).includes(personName)) {
-      acc.hours += parseFloat(j.hours || 0);
-      acc.ot += calcOT(j.checkInTime, j.checkOutTime);
-      acc.jobCount += 1;
-    }
+  const myJobs = jobs.filter(j => jobCreditedPeople(j).includes(personName));
+  const shifts = groupJobsIntoShifts(myJobs);
+  return shifts.reduce((acc, shift) => {
+    acc.hours += shift.totalHours;
+    acc.ot += shift.otHours;
+    acc.jobCount += shift.jobs.length;
     return acc;
   }, { hours: 0, ot: 0, jobCount: 0 });
 }
 
 // Sum hours/OT across ALL people on ALL jobs (team/aggregate total — payroll view).
-// Each person on each job counts separately: 2 people on a 1hr-OT job = 2hrs team OT.
+// Each person's OT is calculated shift-by-shift so travel time between sites on
+// night runs is correctly counted. headcount × per-shift OT = team total OT.
 function teamTotals(jobs) {
-  return jobs.reduce((acc, j) => {
-    const headcount = jobCreditedPeople(j).length || 1;
-    acc.hours += parseFloat(j.hours || 0) * headcount;
-    acc.ot += calcOT(j.checkInTime, j.checkOutTime) * headcount;
+  // Get all unique people across all jobs
+  const allPeople = [...new Set(jobs.flatMap(j => jobCreditedPeople(j)))];
+  return allPeople.reduce((acc, person) => {
+    const totals = personTotals(jobs, person);
+    acc.hours += totals.hours;
+    acc.ot += totals.ot;
     return acc;
   }, { hours: 0, ot: 0 });
 }
@@ -860,7 +1001,167 @@ function JobDetailDropdown({ job: j }) {
   );
 }
 
-// ── Team last-job card for dashboard ─────────────────────────────────
+// ── Shift grouping visual components (Session 7) ──────────────────────
+// Formats a gap duration in ms as "Xh Ym" or "Zm"
+function formatGap(ms) {
+  const totalMin = Math.round(ms / 60000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h > 0 && m > 0) return `${h}h ${m}m`;
+  if (h > 0) return `${h}h`;
+  return `${m}m`;
+}
+
+// Gap indicator between jobs — "travelling · Xm" within a run, "Not on site · Xh Ym" between runs
+function GapIndicator({ gapMs, isTravelling }) {
+  return (
+    <div style={{ display:"flex", alignItems:"center", gap:8, padding:"6px 0", marginLeft:12 }}>
+      <div style={{ width:1, height:18, background:BORDER, flexShrink:0 }} />
+      <span style={{ fontSize:11, color:SLATE_LIGHT, fontStyle:"italic" }}>
+        {isTravelling ? `✈ travelling · ${formatGap(gapMs)}` : `⏸ Not on site · ${formatGap(gapMs)}`}
+      </span>
+    </div>
+  );
+}
+
+// Shift container header — Day or Night
+function ShiftHeader({ shift, showOT, otVisible, isAdminOrSup, onMergeRequest, onSplitRequest }) {
+  const isNight = shift.isNight;
+  const accent = isNight ? "#1E1B4B" : BLUE;
+  const bg = isNight ? "#1E1B4B0A" : BLUE_LIGHT;
+  const border = isNight ? "#1E1B4B33" : `${BLUE}33`;
+
+  const formatTime = (ts) => new Date(ts).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"});
+  const formatDate = (ts) => new Date(ts).toLocaleDateString("en-SG",{day:"2-digit",month:"short"});
+  const {dateStr: startDate} = sgDateParts(shift.shiftIn);
+  const {dateStr: endDate} = sgDateParts(shift.shiftOut);
+  const spanStr = startDate === endDate
+    ? `${formatDate(shift.shiftIn)} · ${formatTime(shift.shiftIn)} – ${formatTime(shift.shiftOut)}`
+    : `${formatDate(shift.shiftIn)} ${formatTime(shift.shiftIn)} – ${formatDate(shift.shiftOut)} ${formatTime(shift.shiftOut)}`;
+
+  return (
+    <div style={{ background:bg, border:`1.5px solid ${border}`, borderRadius:"12px 12px 0 0", padding:"10px 14px" }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:6, marginBottom: isAdminOrSup ? 8 : 0 }}>
+        <div>
+          <div style={{ fontSize:11, fontWeight:800, color:accent, textTransform:"uppercase", letterSpacing:0.5, marginBottom:2, display:"flex", alignItems:"center", gap:6 }}>
+            {isNight ? "🌙 Night run" : "☀️ Day jobs"}
+            {shift.isOverride && <span style={{ fontSize:9, fontWeight:700, padding:"1px 6px", borderRadius:4, background:accent, color:"white", letterSpacing:0.3 }}>EDITED</span>}
+          </div>
+          <div style={{ fontSize:11.5, color:accent, opacity:0.8 }}>{spanStr}</div>
+        </div>
+        <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+          <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:"white", color:accent }}>{shift.totalHours.toFixed(1)} hrs</span>
+          {showOT && otVisible && shift.otHours > 0 && (
+            <span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:accent, color:"white" }}>{shift.otHours.toFixed(1)} OT</span>
+          )}
+          {showOT && !otVisible && (
+            <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:"white", color:SLATE_LIGHT, display:"flex", alignItems:"center", gap:4 }}><Lock size={9} /> OT</span>
+          )}
+          <span style={{ fontSize:11, color:accent, opacity:0.7 }}>{shift.jobs.length} job{shift.jobs.length===1?"":"s"}</span>
+        </div>
+      </div>
+      {isAdminOrSup && (
+        <div style={{ display:"flex", gap:6 }}>
+          {onMergeRequest && (
+            <button onClick={onMergeRequest} style={{ flex:1, padding:"6px 10px", borderRadius:8, border:`1px solid ${accent}44`, background:"white", color:accent, fontSize:11, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
+              Merge with next
+            </button>
+          )}
+          {shift.jobs.length > 1 && onSplitRequest && (
+            <button onClick={onSplitRequest} style={{ flex:1, padding:"6px 10px", borderRadius:8, border:`1px solid ${accent}44`, background:"white", color:accent, fontSize:11, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
+              Split run
+            </button>
+          )}
+          {shift.isOverride && (
+            <button onClick={()=>onSplitRequest&&onSplitRequest("reset")} style={{ padding:"6px 10px", borderRadius:8, border:`1px solid ${SLATE}44`, background:"white", color:SLATE, fontSize:11, fontWeight:600, cursor:"pointer" }}>
+              Reset to auto
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Full shift-grouped job list. Used by My Logs, Personnel log, and Team logs.
+// personName: whose shifts to group by (null = group all jobs by date/time proximity)
+// renderJob: function(job, index) => JSX — the individual job card renderer
+// session, isAdminOrSup: for OT visibility gating
+function ShiftGroupedJobList({ jobs, personName, renderJob, session, isAdminOrSup, showOT = true, onUpdateJob }) {
+  if (!jobs || jobs.length === 0) return null;
+
+  const jobsForGrouping = personName
+    ? jobs.filter(j => jobCreditedPeople(j).includes(personName))
+    : jobs;
+
+  const shifts = groupJobsIntoShifts(jobsForGrouping);
+  const sortedShifts = [...shifts].sort((a, b) => b.shiftIn - a.shiftIn);
+  const otVisible = personName ? canSeeOT(session, personName) : isAdminOrSup;
+
+  // Merge: combine this shift with the chronologically adjacent shift
+  // by giving all jobs in both shifts the same shiftGroup ID
+  const handleMerge = (shift, adjacentShift) => {
+    if (!onUpdateJob || !adjacentShift) return;
+    const groupId = `sg-${Date.now()}`;
+    [...shift.jobs, ...adjacentShift.jobs].forEach(j => onUpdateJob(j.id, { shiftGroup: groupId }));
+  };
+
+  // Split: remove shiftGroup from all jobs in this shift so auto-grouping takes over again
+  // For "reset to auto" — remove shiftGroup entirely
+  // For "split" — give each job a unique shiftGroup so they each become their own shift
+  const handleSplit = (shift, mode) => {
+    if (!onUpdateJob) return;
+    if (mode === "reset") {
+      shift.jobs.forEach(j => onUpdateJob(j.id, { shiftGroup: null }));
+    } else {
+      // Split into individual jobs — each gets its own unique group ID
+      shift.jobs.forEach(j => onUpdateJob(j.id, { shiftGroup: `sg-${j.id}` }));
+    }
+  };
+
+  return (
+    <>
+      {sortedShifts.map((shift, si) => {
+        // Find the chronologically adjacent shift for merge (the one immediately before or after)
+        const adjacentShift = sortedShifts[si + 1] || null; // next oldest shift
+        return (
+          <div key={si} style={{ marginBottom:16 }}>
+            <ShiftHeader
+              shift={shift}
+              showOT={showOT}
+              otVisible={otVisible}
+              isAdminOrSup={isAdminOrSup && !!onUpdateJob}
+              onMergeRequest={adjacentShift ? () => handleMerge(shift, adjacentShift) : null}
+              onSplitRequest={shift.jobs.length > 1 ? (mode) => handleSplit(shift, mode) : null}
+            />
+            <div style={{ border:`1.5px solid ${shift.isNight ? "#1E1B4B33" : `${BLUE}33`}`, borderTop:"none", borderRadius:"0 0 12px 12px", overflow:"hidden" }}>
+              {shift.jobs
+                .slice()
+                .sort((a, b) => a.checkInTime - b.checkInTime)
+                .map((job, ji) => {
+                  const sortedJobs = shift.jobs.slice().sort((a,b)=>a.checkInTime-b.checkInTime);
+                  const prevJob = ji > 0 ? sortedJobs[ji-1] : null;
+                  const gapMs = prevJob ? job.checkInTime - prevJob.checkOutTime : 0;
+                  const isTravelling = shift.isNight && gapMs > 0 && gapMs <= SHIFT_GAP_MS;
+                  const isGap = gapMs > 0;
+                  return (
+                    <React.Fragment key={job.id || ji}>
+                      {isGap && <div style={{ padding:"0 14px" }}><GapIndicator gapMs={gapMs} isTravelling={isTravelling} /></div>}
+                      <div style={{ padding:"12px 14px", borderTop: ji > 0 ? `1px solid ${BORDER}` : "none", background:"white" }}>
+                        {renderJob(job, ji)}
+                      </div>
+                    </React.Fragment>
+                  );
+                })}
+            </div>
+          </div>
+        );
+      })}
+    </>
+  );
+}
 function TeamLastJobCard({ team, jobHistory, filedEntries, onClick }) {
   const accent = teamAccent(team);
   const lastJob = [...jobHistory].filter((j) => j.team === team).sort((a,b) => b.checkOutTime - a.checkOutTime)[0];
@@ -3293,31 +3594,37 @@ export default function AimflowMasterApp() {
         )}
         <div style={{ fontSize:11, fontWeight:700, color:SLATE, margin:"12px 0 10px", textTransform:"uppercase", letterSpacing:0.5 }}>Job history</div>
         {myJobs.length===0 && <div style={{ textAlign:"center", color:SLATE_LIGHT, fontSize:13, padding:"24px 0" }}>No job history yet</div>}
-        {myJobs.map((j,i)=>{
-          const dayType=getDayType(j.checkInTime); const ot=calcOT(j.checkInTime,j.checkOutTime); const premium=isPremiumDay(dayType);
-          const isHelping = j.team!==(userDirectory.find((u)=>u.name===session.name)?.team);
-          return (
-            <div key={j.id||i} style={{ border:j.wasFiledEntry?`1.5px solid #C2570C55`:`1px solid ${BORDER}`, borderRadius:13, padding:15, marginBottom:10, background:j.wasFiledEntry?"#FFFBF7":"white" }}>
-              {j.wasFiledEntry && <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:10, padding:"6px 10px", background:"#FEF0E6", borderRadius:8, color:"#C2570C", fontSize:11, fontWeight:700 }}><FileClock size={13} /> Filed entry — approved by {j.approvedBy||"supervisor"}</div>}
-              <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:8, flexWrap:"wrap" }}>
-                <span style={{ fontSize:11, fontWeight:700, padding:"3px 9px", borderRadius:7, background:CANVAS, color:"#374151", display:"inline-flex", alignItems:"center", gap:5 }}><TeamIcon team={j.team} size={12} color={teamAccent(j.team)} /> {teamLabel(j.team)}</span>
-                {isHelping && <span style={{ fontSize:10.5, fontWeight:700, padding:"3px 8px", borderRadius:7, background:PURPLE_LIGHT, color:PURPLE }}>Supporting another team</span>}
-                <span style={{ fontSize:11, color:premium?RED:SLATE_LIGHT, fontWeight:premium?700:400, marginLeft:"auto" }}>{dayType}</span>
+        <ShiftGroupedJobList
+          jobs={myJobs}
+          personName={session.name}
+          session={session}
+          isAdminOrSup={isAdminOrSup}
+          renderJob={(j) => {
+            const dayType=getDayType(j.checkInTime); const ot=calcOT(j.checkInTime,j.checkOutTime); const premium=isPremiumDay(dayType);
+            const isHelping = j.team!==(userDirectory.find((u)=>u.name===session.name)?.team);
+            return (
+              <div>
+                {j.wasFiledEntry && <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:10, padding:"6px 10px", background:"#FEF0E6", borderRadius:8, color:"#C2570C", fontSize:11, fontWeight:700 }}><FileClock size={13} /> Filed entry — approved by {j.approvedBy||"supervisor"}</div>}
+                <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:8, flexWrap:"wrap" }}>
+                  <span style={{ fontSize:11, fontWeight:700, padding:"3px 9px", borderRadius:7, background:CANVAS, color:"#374151", display:"inline-flex", alignItems:"center", gap:5 }}><TeamIcon team={j.team} size={12} color={teamAccent(j.team)} /> {teamLabel(j.team)}</span>
+                  {isHelping && <span style={{ fontSize:10.5, fontWeight:700, padding:"3px 8px", borderRadius:7, background:PURPLE_LIGHT, color:PURPLE }}>Supporting another team</span>}
+                  <span style={{ fontSize:11, color:premium?RED:SLATE_LIGHT, fontWeight:premium?700:400, marginLeft:"auto" }}>{dayType}</span>
+                </div>
+                <div style={{ fontSize:14.5, fontWeight:700, color:INK, marginBottom:2 }}>{j.jobSite}</div>
+                <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
+                  {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
+                  {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+                  {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+                </div>
+                <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                  <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{j.hours} hrs</span>
+                  {ot>0 && <span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:premium?RED_LIGHT:GREEN_LIGHT, color:premium?RED:GREEN_DARK }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span>}
+                </div>
+                <JobDetailDropdown job={j} />
               </div>
-              <div style={{ fontSize:14.5, fontWeight:700, color:INK, marginBottom:2 }}>{j.jobSite}</div>
-              <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
-                {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
-                {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
-                {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
-              </div>
-              <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-                <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{j.hours} hrs</span>
-                {ot>0 && <span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:premium?RED_LIGHT:GREEN_LIGHT, color:premium?RED:GREEN_DARK }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span>}
-              </div>
-              <JobDetailDropdown job={j} />
-            </div>
-          );
-        })}
+            );
+          }}
+        />
       </Shell>
     );
   }
@@ -3361,7 +3668,6 @@ export default function AimflowMasterApp() {
     const accent=teamAccent(logTeamFilter);
     const sorters={
       date_desc:(a,b)=>b.checkInTime-a.checkInTime, date_asc:(a,b)=>a.checkInTime-b.checkInTime,
-      name_asc:(a,b)=>a.checker.localeCompare(b.checker), site_asc:(a,b)=>a.jobSite.localeCompare(b.jobSite),
     };
     let teamJobs=[...currentJobHistory.filter((j)=>j.team===logTeamFilter)].sort(sorters[jobSort]||sorters.date_desc);
     // Search filter
@@ -3375,7 +3681,7 @@ export default function AimflowMasterApp() {
       );
     }
     const { hours: totHrs, ot: totOT } = teamTotals(teamJobs);
-    const sortOptions=[{key:"date_desc",label:"Newest"},{key:"date_asc",label:"Oldest"},{key:"name_asc",label:"Checker A–Z"},{key:"site_asc",label:"Site A–Z"}];
+    const sortOptions=[{key:"date_desc",label:"Newest"},{key:"date_asc",label:"Oldest"}];
     return (
       <Shell>
         <Header title={`${teamLabel(logTeamFilter)} jobs`} onBack={()=>goBack("jobLogTeam")} accent={accent} />
@@ -3400,49 +3706,57 @@ export default function AimflowMasterApp() {
         </div>
         <div style={{ marginBottom:14 }}><ChipGroup options={sortOptions.map((o)=>o.label)} value={sortOptions.find((o)=>o.key===jobSort)?.label} onPick={(label)=>setJobSort(sortOptions.find((o)=>o.label===label).key)} accent={accent} /></div>
         {teamJobs.length===0 && <div style={{ textAlign:"center", color:SLATE_LIGHT, fontSize:13, padding:"24px 0" }}>No results</div>}
-        {teamJobs.map((j,i)=>{
-          const dayType=getDayType(j.checkInTime); const ot=calcOT(j.checkInTime,j.checkOutTime); const premium=isPremiumDay(dayType);
-          const allPeople=[...new Set(j.crew||[])];
-          const isLongEntry=parseFloat(j.hours||0)>12;
-          return (
-            <div key={j.id||i} style={{ border:isLongEntry?`1.5px solid ${AMBER}`:j.wasFiledEntry?`1.5px solid #C2570C55`:`1px solid ${BORDER}`, borderRadius:13, padding:15, marginBottom:10, background:isLongEntry?AMBER_LIGHT:j.wasFiledEntry?"#FFFBF7":"white" }}>
-              {isLongEntry && <div style={{ fontSize:11, color:AMBER_DARK, fontWeight:700, marginBottom:8 }}>⚠️ Long job ({j.hours} hrs)</div>}
-              {j.wasFiledEntry && <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:10, padding:"6px 10px", background:"#FEF0E6", borderRadius:8, color:"#C2570C", fontSize:11, fontWeight:700 }}><FileClock size={13} /> Filed entry — approved by {j.approvedBy||"supervisor"}</div>}
-              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
-                <span style={{ fontSize:11, fontWeight:700, padding:"3px 9px", borderRadius:7, background:BLUE_LIGHT, color:BLUE }}>Checked in by {j.checker}</span>
-                <span style={{ fontSize:11, color:premium?RED:SLATE_LIGHT, fontWeight:premium?700:400 }}>{dayType}</span>
-              </div>
-              <div style={{ fontSize:14.5, fontWeight:700, color:j.jobSite?INK:SLATE_LIGHT, marginBottom:2, fontStyle:j.jobSite?"normal":"italic" }}>{j.jobSite||"No site recorded"}</div>
-              <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
-                {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
-                {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
-                {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
-                {" · "}<strong>{j.hours} hrs</strong>
-                {ot>0 && isAdminOrSup && <> · <span style={{ color:premium?RED:GREEN_DARK, fontWeight:700 }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span></>}
-              </div>
-              {j.vehicles?.length>0 && <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:8 }}>{j.vehicles.map((v)=><span key={v} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}><Truck size={11} color="#6B7280" />{v}</span>)}</div>}
-              <div style={{ fontSize:10.5, fontWeight:700, color:SLATE, marginBottom:6, textTransform:"uppercase", letterSpacing:0.3 }}>Personnel</div>
-              <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
-                {allPeople.map((person)=>{
-                  const otVisible=canSeeOT(session,person);
-                  return (
-                    <span key={person} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11.5, fontWeight:600, padding:"4px 9px", borderRadius:7, background:CANVAS, color:INK }}>
-                      {person}
-                      {otVisible ? (ot>0 && <span style={{ color:premium?RED:GREEN_DARK, fontWeight:700 }}>· {ot.toFixed(1)} OT</span>) : <Lock size={9} color={SLATE_LIGHT} />}
-                    </span>
-                  );
-                })}
-              </div>
-              <JobDetailDropdown job={j} />
-              {isAdminOrSup && session.role!=="beta" && (
-                <div style={{ display:"flex", gap:8, marginTop:10 }}>
-                  <button onClick={()=>{setEditTarget(j);setEditDraft({jobSite:j.jobSite,manualCheckIn:new Date(j.checkInTime-new Date(j.checkInTime).getTimezoneOffset()*60000).toISOString().slice(0,16),manualCheckOut:new Date(j.checkOutTime-new Date(j.checkOutTime).getTimezoneOffset()*60000).toISOString().slice(0,16),vehicles:[...(j.vehicles||[])],crew:[...(j.crew||[])],jobsheet:j.jobsheet||"",pubDisposal:j.pubDisposal||"",remarks:j.remarks||""});setScreen("editEntry");}} style={{ flex:1, padding:10, borderRadius:9, border:`1px solid ${BLUE}`, background:"white", color:BLUE, fontSize:12.5, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Pencil size={13} /> Edit</button>
-                  <button onClick={()=>{setEntryDeleteTarget(j);setEntryDeleteCode("");setEntryDeleteError(null);setScreen("entryDeleteConfirm");}} style={{ flex:1, padding:10, borderRadius:9, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:12.5, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Trash2 size={13} /> Delete</button>
+        <ShiftGroupedJobList
+          jobs={teamJobs}
+          personName={null}
+          showOT={false}
+          session={session}
+          isAdminOrSup={isAdminOrSup}
+          onUpdateJob={isAdminOrSup ? (id, data) => updateJob(id, data) : null}
+          renderJob={(j) => {
+            const dayType=getDayType(j.checkInTime); const ot=calcOT(j.checkInTime,j.checkOutTime); const premium=isPremiumDay(dayType);
+            const allPeople=[...new Set(j.crew||[])];
+            const isLongEntry=parseFloat(j.hours||0)>12;
+            return (
+              <div style={{ background:isLongEntry?AMBER_LIGHT:j.wasFiledEntry?"#FFFBF7":"white" }}>
+                {isLongEntry && <div style={{ fontSize:11, color:AMBER_DARK, fontWeight:700, marginBottom:8 }}>⚠️ Long job ({j.hours} hrs)</div>}
+                {j.wasFiledEntry && <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:10, padding:"6px 10px", background:"#FEF0E6", borderRadius:8, color:"#C2570C", fontSize:11, fontWeight:700 }}><FileClock size={13} /> Filed entry — approved by {j.approvedBy||"supervisor"}</div>}
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+                  <span style={{ fontSize:11, fontWeight:700, padding:"3px 9px", borderRadius:7, background:BLUE_LIGHT, color:BLUE }}>Checked in by {j.checker}</span>
+                  <span style={{ fontSize:11, color:premium?RED:SLATE_LIGHT, fontWeight:premium?700:400 }}>{dayType}</span>
                 </div>
-              )}
-            </div>
-          );
-        })}
+                <div style={{ fontSize:14.5, fontWeight:700, color:j.jobSite?INK:SLATE_LIGHT, marginBottom:2, fontStyle:j.jobSite?"normal":"italic" }}>{j.jobSite||"No site recorded"}</div>
+                <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
+                  {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
+                  {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+                  {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+                  {" · "}<strong>{j.hours} hrs</strong>
+                  {ot>0 && isAdminOrSup && <> · <span style={{ color:premium?RED:GREEN_DARK, fontWeight:700 }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span></>}
+                </div>
+                {j.vehicles?.length>0 && <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:8 }}>{j.vehicles.map((v)=><span key={v} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}><Truck size={11} color="#6B7280" />{v}</span>)}</div>}
+                <div style={{ fontSize:10.5, fontWeight:700, color:SLATE, marginBottom:6, textTransform:"uppercase", letterSpacing:0.3 }}>Personnel</div>
+                <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                  {allPeople.map((person)=>{
+                    const otVisible=canSeeOT(session,person);
+                    return (
+                      <span key={person} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11.5, fontWeight:600, padding:"4px 9px", borderRadius:7, background:CANVAS, color:INK }}>
+                        {person}
+                        {otVisible ? (ot>0 && <span style={{ color:premium?RED:GREEN_DARK, fontWeight:700 }}>· {ot.toFixed(1)} OT</span>) : <Lock size={9} color={SLATE_LIGHT} />}
+                      </span>
+                    );
+                  })}
+                </div>
+                <JobDetailDropdown job={j} />
+                {isAdminOrSup && session.role!=="beta" && (
+                  <div style={{ display:"flex", gap:8, marginTop:10 }}>
+                    <button onClick={()=>{setEditTarget(j);setEditDraft({jobSite:j.jobSite,manualCheckIn:new Date(j.checkInTime-new Date(j.checkInTime).getTimezoneOffset()*60000).toISOString().slice(0,16),manualCheckOut:new Date(j.checkOutTime-new Date(j.checkOutTime).getTimezoneOffset()*60000).toISOString().slice(0,16),vehicles:[...(j.vehicles||[])],crew:[...(j.crew||[])],jobsheet:j.jobsheet||"",pubDisposal:j.pubDisposal||"",remarks:j.remarks||""});setScreen("editEntry");}} style={{ flex:1, padding:10, borderRadius:9, border:`1px solid ${BLUE}`, background:"white", color:BLUE, fontSize:12.5, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Pencil size={13} /> Edit</button>
+                    <button onClick={()=>{setEntryDeleteTarget(j);setEntryDeleteCode("");setEntryDeleteError(null);setScreen("entryDeleteConfirm");}} style={{ flex:1, padding:10, borderRadius:9, border:`1px solid ${RED}`, background:"white", color:RED, fontSize:12.5, fontWeight:700, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}><Trash2 size={13} /> Delete</button>
+                  </div>
+                )}
+              </div>
+            );
+          }}
+        />
       </Shell>
     );
   }
@@ -3478,28 +3792,34 @@ export default function AimflowMasterApp() {
               </div>
             </div>
             {myJobs.length===0 && <div style={{ textAlign:"center", color:SLATE_LIGHT, fontSize:13, padding:"24px 0" }}>No job history yet</div>}
-            {myJobs.map((j,i)=>{
-              const dayType=getDayType(j.checkInTime); const ot=calcOT(j.checkInTime,j.checkOutTime); const premium=isPremiumDay(dayType);
-              return (
-                <div key={j.id||i} style={{ border:`1px solid ${BORDER}`, borderRadius:13, padding:15, marginBottom:10, background:"white" }}>
-                  <div style={{ display:"flex", gap:6, marginBottom:8, flexWrap:"wrap" }}>
-                    <span style={{ fontSize:11, fontWeight:700, padding:"3px 9px", borderRadius:7, background:CANVAS, color:"#374151", display:"inline-flex", alignItems:"center", gap:5 }}><TeamIcon team={j.team} size={12} color={teamAccent(j.team)} /> {teamLabel(j.team)}</span>
-                    <span style={{ fontSize:11, color:premium?RED:SLATE_LIGHT, fontWeight:premium?700:400, marginLeft:"auto" }}>{dayType}</span>
+            <ShiftGroupedJobList
+              jobs={myJobs}
+              personName={involvedTarget}
+              session={session}
+              isAdminOrSup={isAdminOrSup}
+              renderJob={(j) => {
+                const dayType=getDayType(j.checkInTime); const ot=calcOT(j.checkInTime,j.checkOutTime); const premium=isPremiumDay(dayType);
+                return (
+                  <div>
+                    <div style={{ display:"flex", gap:6, marginBottom:8, flexWrap:"wrap" }}>
+                      <span style={{ fontSize:11, fontWeight:700, padding:"3px 9px", borderRadius:7, background:CANVAS, color:"#374151", display:"inline-flex", alignItems:"center", gap:5 }}><TeamIcon team={j.team} size={12} color={teamAccent(j.team)} /> {teamLabel(j.team)}</span>
+                      <span style={{ fontSize:11, color:premium?RED:SLATE_LIGHT, fontWeight:premium?700:400, marginLeft:"auto" }}>{dayType}</span>
+                    </div>
+                    <div style={{ fontSize:14.5, fontWeight:700, color:INK, marginBottom:2 }}>{j.jobSite}</div>
+                    <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
+                      {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
+                      {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+                      {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
+                      {j.checker!==involvedTarget&&` · checked in by ${j.checker}`}
+                    </div>
+                    <div style={{ display:"flex", gap:6 }}>
+                      <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{j.hours} hrs</span>
+                      {otVisible?(ot>0&&<span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:premium?RED_LIGHT:GREEN_LIGHT, color:premium?RED:GREEN_DARK }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span>):<span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:SLATE_LIGHT, display:"flex", alignItems:"center", gap:4 }}><Lock size={10} /> OT hidden</span>}
+                    </div>
                   </div>
-                  <div style={{ fontSize:14.5, fontWeight:700, color:INK, marginBottom:2 }}>{j.jobSite}</div>
-                  <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
-                    {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
-                    {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
-                    {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
-                    {j.checker!==involvedTarget&&` · checked in by ${j.checker}`}
-                  </div>
-                  <div style={{ display:"flex", gap:6 }}>
-                    <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{j.hours} hrs</span>
-                    {otVisible?(ot>0&&<span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:premium?RED_LIGHT:GREEN_LIGHT, color:premium?RED:GREEN_DARK }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span>):<span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:SLATE_LIGHT, display:"flex", alignItems:"center", gap:4 }}><Lock size={10} /> OT hidden</span>}
-                  </div>
-                </div>
-              );
-            })}
+                );
+              }}
+            />
           </>
         )}
       </Shell>
