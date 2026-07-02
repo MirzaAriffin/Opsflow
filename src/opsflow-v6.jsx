@@ -178,20 +178,40 @@ function isNightJob(job) {
 function groupJobsIntoShifts(jobs) {
   if (!jobs || jobs.length === 0) return [];
 
-  // Sort ascending by check-in time
   const sorted = [...jobs]
     .filter(j => j.checkInTime && j.checkOutTime)
     .sort((a, b) => a.checkInTime - b.checkInTime);
 
   if (sorted.length === 0) return [];
 
-  const shifts = [];
-  let current = null;
-
+  // First pass: group jobs that share an explicit shiftGroup override
+  // Jobs with the same shiftGroup ID are always in the same shift regardless of gap/time
+  const overrideGroups = {};
+  const noOverride = [];
   for (const job of sorted) {
+    if (job.shiftGroup) {
+      if (!overrideGroups[job.shiftGroup]) overrideGroups[job.shiftGroup] = [];
+      overrideGroups[job.shiftGroup].push(job);
+    } else {
+      noOverride.push(job);
+    }
+  }
+
+  // Convert override groups into shift objects directly
+  const overrideShifts = Object.values(overrideGroups).map(groupJobs => {
+    const sortedGroup = [...groupJobs].sort((a,b) => a.checkInTime - b.checkInTime);
+    // Night if any job in the group is a night job
+    const isNight = sortedGroup.some(j => isNightJob(j));
+    const {dateStr} = sgDateParts(sortedGroup[0].checkInTime);
+    return { jobs: sortedGroup, isNight, dateStr, isOverride: true };
+  });
+
+  // Second pass: auto-group remaining jobs by threshold
+  const autoShifts = [];
+  let current = null;
+  for (const job of noOverride) {
     const night = isNightJob(job);
     const {dateStr} = sgDateParts(job.checkInTime);
-
     if (!current) {
       current = { jobs: [job], isNight: night, dateStr };
     } else {
@@ -199,25 +219,22 @@ function groupJobsIntoShifts(jobs) {
       const gap = job.checkInTime - lastJob.checkOutTime;
       const sameNight = night && current.isNight;
       const sameDay = !night && !current.isNight && dateStr === current.dateStr;
-
       if (sameNight && gap <= SHIFT_GAP_MS) {
-        // Same night run — add to current shift
         current.jobs.push(job);
       } else if (sameDay) {
-        // Same calendar day, both day jobs — always group visually
         current.jobs.push(job);
       } else {
-        // Different shift — save current and start new
-        shifts.push(current);
+        autoShifts.push(current);
         current = { jobs: [job], isNight: night, dateStr };
       }
     }
   }
-  if (current) shifts.push(current);
+  if (current) autoShifts.push(current);
 
-  // For each shift, compute the merged time span and OT
-  return shifts.map(shift => {
-    // Merge overlapping/adjacent spans within the shift
+  // Combine override and auto shifts, then compute spans and OT for all
+  const allShifts = [...overrideShifts, ...autoShifts];
+
+  return allShifts.map(shift => {
     const spans = shift.jobs.map(j => ({ in: j.checkInTime, out: j.checkOutTime }));
     spans.sort((a, b) => a.in - b.in);
     const merged = [];
@@ -228,31 +245,17 @@ function groupJobsIntoShifts(jobs) {
         merged[merged.length-1].out = Math.max(merged[merged.length-1].out, span.out);
       }
     }
-
     const shiftIn = merged[0].in;
     const shiftOut = merged[merged.length-1].out;
-
-    // OT calculated on merged spans — not on raw shiftIn→shiftOut, to avoid
-    // counting a >1.5hr intra-day gap as OT for day shifts.
-    // For night shifts, the gap between sites counts as OT (travel time).
     let otHours = 0;
     if (shift.isNight) {
-      // Night shift: OT on full span from shiftIn to shiftOut (travel gaps included)
       otHours = calcOT(shiftIn, shiftOut);
     } else {
-      // Day shift: OT on each job individually (gaps between jobs not counted)
-      // Jobs that cross 5:30pm still get their after-cutoff portion calculated
-      for (const j of shift.jobs) {
-        otHours += calcOT(j.checkInTime, j.checkOutTime);
-      }
+      for (const j of shift.jobs) otHours += calcOT(j.checkInTime, j.checkOutTime);
       otHours = roundOT(otHours);
     }
-
-    // Total hours = sum of all individual job durations (not the full span)
-    // This is what shows on the timesheet — actual time on site, not including travel
     const totalHours = roundOT(shift.jobs.reduce((sum, j) =>
       sum + (j.checkOutTime - j.checkInTime) / 3600000, 0));
-
     return {
       jobs: shift.jobs,
       shiftIn,
@@ -261,6 +264,7 @@ function groupJobsIntoShifts(jobs) {
       totalHours,
       isNight: shift.isNight,
       dateStr: shift.dateStr,
+      isOverride: !!shift.isOverride,
     };
   });
 }
@@ -1021,13 +1025,12 @@ function GapIndicator({ gapMs, isTravelling }) {
 }
 
 // Shift container header — Day or Night
-function ShiftHeader({ shift, showOT, otVisible }) {
+function ShiftHeader({ shift, showOT, otVisible, isAdminOrSup, onMergeRequest, onSplitRequest }) {
   const isNight = shift.isNight;
   const accent = isNight ? "#1E1B4B" : BLUE;
   const bg = isNight ? "#1E1B4B0A" : BLUE_LIGHT;
   const border = isNight ? "#1E1B4B33" : `${BLUE}33`;
 
-  // Format the shift time range
   const formatTime = (ts) => new Date(ts).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"});
   const formatDate = (ts) => new Date(ts).toLocaleDateString("en-SG",{day:"2-digit",month:"short"});
   const {dateStr: startDate} = sgDateParts(shift.shiftIn);
@@ -1037,23 +1040,47 @@ function ShiftHeader({ shift, showOT, otVisible }) {
     : `${formatDate(shift.shiftIn)} ${formatTime(shift.shiftIn)} – ${formatDate(shift.shiftOut)} ${formatTime(shift.shiftOut)}`;
 
   return (
-    <div style={{ background:bg, border:`1.5px solid ${border}`, borderRadius:"12px 12px 0 0", padding:"10px 14px", display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:6 }}>
-      <div>
-        <div style={{ fontSize:11, fontWeight:800, color:accent, textTransform:"uppercase", letterSpacing:0.5, marginBottom:2 }}>
-          {isNight ? "🌙 Night run" : "☀️ Day jobs"}
+    <div style={{ background:bg, border:`1.5px solid ${border}`, borderRadius:"12px 12px 0 0", padding:"10px 14px" }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:6, marginBottom: isAdminOrSup ? 8 : 0 }}>
+        <div>
+          <div style={{ fontSize:11, fontWeight:800, color:accent, textTransform:"uppercase", letterSpacing:0.5, marginBottom:2, display:"flex", alignItems:"center", gap:6 }}>
+            {isNight ? "🌙 Night run" : "☀️ Day jobs"}
+            {shift.isOverride && <span style={{ fontSize:9, fontWeight:700, padding:"1px 6px", borderRadius:4, background:accent, color:"white", letterSpacing:0.3 }}>EDITED</span>}
+          </div>
+          <div style={{ fontSize:11.5, color:accent, opacity:0.8 }}>{spanStr}</div>
         </div>
-        <div style={{ fontSize:11.5, color:accent, opacity:0.8 }}>{spanStr}</div>
+        <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+          <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:"white", color:accent }}>{shift.totalHours.toFixed(1)} hrs</span>
+          {showOT && otVisible && shift.otHours > 0 && (
+            <span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:accent, color:"white" }}>{shift.otHours.toFixed(1)} OT</span>
+          )}
+          {showOT && !otVisible && (
+            <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:"white", color:SLATE_LIGHT, display:"flex", alignItems:"center", gap:4 }}><Lock size={9} /> OT</span>
+          )}
+          <span style={{ fontSize:11, color:accent, opacity:0.7 }}>{shift.jobs.length} job{shift.jobs.length===1?"":"s"}</span>
+        </div>
       </div>
-      <div style={{ display:"flex", gap:6, alignItems:"center" }}>
-        <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:"white", color:accent }}>{shift.totalHours.toFixed(1)} hrs</span>
-        {showOT && otVisible && shift.otHours > 0 && (
-          <span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:accent, color:"white" }}>{shift.otHours.toFixed(1)} OT</span>
-        )}
-        {showOT && !otVisible && (
-          <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:"white", color:SLATE_LIGHT, display:"flex", alignItems:"center", gap:4 }}><Lock size={9} /> OT</span>
-        )}
-        <span style={{ fontSize:11, color:accent, opacity:0.7 }}>{shift.jobs.length} job{shift.jobs.length===1?"":"s"}</span>
-      </div>
+      {isAdminOrSup && (
+        <div style={{ display:"flex", gap:6 }}>
+          {onMergeRequest && (
+            <button onClick={onMergeRequest} style={{ flex:1, padding:"6px 10px", borderRadius:8, border:`1px solid ${accent}44`, background:"white", color:accent, fontSize:11, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
+              Merge with next
+            </button>
+          )}
+          {shift.jobs.length > 1 && onSplitRequest && (
+            <button onClick={onSplitRequest} style={{ flex:1, padding:"6px 10px", borderRadius:8, border:`1px solid ${accent}44`, background:"white", color:accent, fontSize:11, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
+              Split run
+            </button>
+          )}
+          {shift.isOverride && (
+            <button onClick={()=>onSplitRequest&&onSplitRequest("reset")} style={{ padding:"6px 10px", borderRadius:8, border:`1px solid ${SLATE}44`, background:"white", color:SLATE, fontSize:11, fontWeight:600, cursor:"pointer" }}>
+              Reset to auto
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1062,7 +1089,7 @@ function ShiftHeader({ shift, showOT, otVisible }) {
 // personName: whose shifts to group by (null = group all jobs by date/time proximity)
 // renderJob: function(job, index) => JSX — the individual job card renderer
 // session, isAdminOrSup: for OT visibility gating
-function ShiftGroupedJobList({ jobs, personName, renderJob, session, isAdminOrSup, showOT = true }) {
+function ShiftGroupedJobList({ jobs, personName, renderJob, session, isAdminOrSup, showOT = true, onUpdateJob }) {
   if (!jobs || jobs.length === 0) return null;
 
   const jobsForGrouping = personName
@@ -1073,33 +1100,65 @@ function ShiftGroupedJobList({ jobs, personName, renderJob, session, isAdminOrSu
   const sortedShifts = [...shifts].sort((a, b) => b.shiftIn - a.shiftIn);
   const otVisible = personName ? canSeeOT(session, personName) : isAdminOrSup;
 
+  // Merge: combine this shift with the chronologically adjacent shift
+  // by giving all jobs in both shifts the same shiftGroup ID
+  const handleMerge = (shift, adjacentShift) => {
+    if (!onUpdateJob || !adjacentShift) return;
+    const groupId = `sg-${Date.now()}`;
+    [...shift.jobs, ...adjacentShift.jobs].forEach(j => onUpdateJob(j.id, { shiftGroup: groupId }));
+  };
+
+  // Split: remove shiftGroup from all jobs in this shift so auto-grouping takes over again
+  // For "reset to auto" — remove shiftGroup entirely
+  // For "split" — give each job a unique shiftGroup so they each become their own shift
+  const handleSplit = (shift, mode) => {
+    if (!onUpdateJob) return;
+    if (mode === "reset") {
+      shift.jobs.forEach(j => onUpdateJob(j.id, { shiftGroup: null }));
+    } else {
+      // Split into individual jobs — each gets its own unique group ID
+      shift.jobs.forEach(j => onUpdateJob(j.id, { shiftGroup: `sg-${j.id}` }));
+    }
+  };
+
   return (
     <>
-      {sortedShifts.map((shift, si) => (
-        <div key={si} style={{ marginBottom:16 }}>
-          <ShiftHeader shift={shift} showOT={showOT} otVisible={otVisible} />
-          <div style={{ border:`1.5px solid ${shift.isNight ? "#1E1B4B33" : `${BLUE}33`}`, borderTop:"none", borderRadius:"0 0 12px 12px", overflow:"hidden" }}>
-            {shift.jobs
-              .slice()
-              .sort((a, b) => a.checkInTime - b.checkInTime)
-              .map((job, ji) => {
-                const sortedJobs = shift.jobs.slice().sort((a,b)=>a.checkInTime-b.checkInTime);
-                const prevJob = ji > 0 ? sortedJobs[ji-1] : null;
-                const gapMs = prevJob ? job.checkInTime - prevJob.checkOutTime : 0;
-                const isTravelling = shift.isNight && gapMs > 0 && gapMs <= SHIFT_GAP_MS;
-                const isGap = gapMs > 0;
-                return (
-                  <React.Fragment key={job.id || ji}>
-                    {isGap && <div style={{ padding:"0 14px" }}><GapIndicator gapMs={gapMs} isTravelling={isTravelling} /></div>}
-                    <div style={{ padding:"12px 14px", borderTop: ji > 0 ? `1px solid ${BORDER}` : "none", background:"white" }}>
-                      {renderJob(job, ji)}
-                    </div>
-                  </React.Fragment>
-                );
-              })}
+      {sortedShifts.map((shift, si) => {
+        // Find the chronologically adjacent shift for merge (the one immediately before or after)
+        const adjacentShift = sortedShifts[si + 1] || null; // next oldest shift
+        return (
+          <div key={si} style={{ marginBottom:16 }}>
+            <ShiftHeader
+              shift={shift}
+              showOT={showOT}
+              otVisible={otVisible}
+              isAdminOrSup={isAdminOrSup && !!onUpdateJob}
+              onMergeRequest={adjacentShift ? () => handleMerge(shift, adjacentShift) : null}
+              onSplitRequest={shift.jobs.length > 1 ? (mode) => handleSplit(shift, mode) : null}
+            />
+            <div style={{ border:`1.5px solid ${shift.isNight ? "#1E1B4B33" : `${BLUE}33`}`, borderTop:"none", borderRadius:"0 0 12px 12px", overflow:"hidden" }}>
+              {shift.jobs
+                .slice()
+                .sort((a, b) => a.checkInTime - b.checkInTime)
+                .map((job, ji) => {
+                  const sortedJobs = shift.jobs.slice().sort((a,b)=>a.checkInTime-b.checkInTime);
+                  const prevJob = ji > 0 ? sortedJobs[ji-1] : null;
+                  const gapMs = prevJob ? job.checkInTime - prevJob.checkOutTime : 0;
+                  const isTravelling = shift.isNight && gapMs > 0 && gapMs <= SHIFT_GAP_MS;
+                  const isGap = gapMs > 0;
+                  return (
+                    <React.Fragment key={job.id || ji}>
+                      {isGap && <div style={{ padding:"0 14px" }}><GapIndicator gapMs={gapMs} isTravelling={isTravelling} /></div>}
+                      <div style={{ padding:"12px 14px", borderTop: ji > 0 ? `1px solid ${BORDER}` : "none", background:"white" }}>
+                        {renderJob(job, ji)}
+                      </div>
+                    </React.Fragment>
+                  );
+                })}
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </>
   );
 }
@@ -3609,7 +3668,6 @@ export default function AimflowMasterApp() {
     const accent=teamAccent(logTeamFilter);
     const sorters={
       date_desc:(a,b)=>b.checkInTime-a.checkInTime, date_asc:(a,b)=>a.checkInTime-b.checkInTime,
-      name_asc:(a,b)=>a.checker.localeCompare(b.checker), site_asc:(a,b)=>a.jobSite.localeCompare(b.jobSite),
     };
     let teamJobs=[...currentJobHistory.filter((j)=>j.team===logTeamFilter)].sort(sorters[jobSort]||sorters.date_desc);
     // Search filter
@@ -3623,7 +3681,7 @@ export default function AimflowMasterApp() {
       );
     }
     const { hours: totHrs, ot: totOT } = teamTotals(teamJobs);
-    const sortOptions=[{key:"date_desc",label:"Newest"},{key:"date_asc",label:"Oldest"},{key:"name_asc",label:"Checker A–Z"},{key:"site_asc",label:"Site A–Z"}];
+    const sortOptions=[{key:"date_desc",label:"Newest"},{key:"date_asc",label:"Oldest"}];
     return (
       <Shell>
         <Header title={`${teamLabel(logTeamFilter)} jobs`} onBack={()=>goBack("jobLogTeam")} accent={accent} />
@@ -3654,6 +3712,7 @@ export default function AimflowMasterApp() {
           showOT={false}
           session={session}
           isAdminOrSup={isAdminOrSup}
+          onUpdateJob={isAdminOrSup ? (id, data) => updateJob(id, data) : null}
           renderJob={(j) => {
             const dayType=getDayType(j.checkInTime); const ot=calcOT(j.checkInTime,j.checkOutTime); const premium=isPremiumDay(dayType);
             const allPeople=[...new Set(j.crew||[])];
