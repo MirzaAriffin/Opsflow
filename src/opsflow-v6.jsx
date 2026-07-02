@@ -1173,6 +1173,7 @@ export default function AimflowMasterApp() {
   // ── Transient UI state ────────────────────────────────────────────
   const [draft, setDraft] = useState(emptyDraft());
   const [checkoutDraft, setCheckoutDraft] = useState(emptyCheckout());
+  const [lastCompletedJob, setLastCompletedJob] = useState(null);
   const [fuelDraft, setFuelDraft] = useState(emptyFuelDraft());
   const [logTeamFilter, setLogTeamFilter] = useState(null);
   const [logPersonName, setLogPersonName] = useState(null);
@@ -1345,7 +1346,7 @@ export default function AimflowMasterApp() {
   const nowFn = () => { if(isBeta&&draft.manualCheckIn){const t=new Date(draft.manualCheckIn).getTime();if(!isNaN(t))return t;} return Date.now(); };
   const checkoutNowFn = () => { if(isBeta&&checkoutDraft.manualCheckOut){const t=new Date(checkoutDraft.manualCheckOut).getTime();if(!isNaN(t))return t;} return Date.now(); };
   const handleLogin = (user) => { lastActivityRef.current=Date.now(); setSession(user); setScreen("landing"); };
-  const handleLogout = () => { screenHistoryRef.current = []; setSession(null); setScreenRaw("landing"); setDraft(emptyDraft()); setCheckoutDraft(emptyCheckout()); setFuelDraft(emptyFuelDraft()); setLogPersonName(null); setLogVehicleName(null); setLogTeamFilter(null); setEditingFiledEntry(null); };
+  const handleLogout = () => { screenHistoryRef.current = []; setSession(null); setScreenRaw("landing"); setDraft(emptyDraft()); setCheckoutDraft(emptyCheckout()); setFuelDraft(emptyFuelDraft()); setLogPersonName(null); setLogVehicleName(null); setLogTeamFilter(null); setEditingFiledEntry(null); setLastCompletedJob(null); };
 
   // ── Firestore write helpers ───────────────────────────────────────
   const fsOp = async (fn) => {
@@ -2613,6 +2614,7 @@ export default function AimflowMasterApp() {
           if (isBeta) { setBetaJobHistory((p)=>[completed,...p]); setBetaActiveJobs((p)=>p.filter((j)=>j.checker!==session.name)); }
           else { addJob(completed); clearActiveJob(session.name); }
           setDraft(emptyDraft()); setCheckoutDraft(emptyCheckout());
+          setLastCompletedJob(completed);
           setScreen("checkoutDone");
         }}>
           <Check size={16} /> Confirm check-out
@@ -2622,7 +2624,7 @@ export default function AimflowMasterApp() {
   }
 
   if (screen === "checkoutDone") {
-    const lastJob = (isBeta ? betaJobHistory : jobHistory)[0];
+    const lastJob = lastCompletedJob;
     const serviceSummary = (lastJob?.serviceLines||[]).map((l)=>`${l.type}${l.qty?` ×${l.qty}`:""}${l.freq?` (${l.freq})`:""}`).join(" · ");
     return (
       <Shell>
