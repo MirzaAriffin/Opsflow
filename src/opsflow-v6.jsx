@@ -1470,11 +1470,17 @@ export default function AimflowMasterApp() {
   // filedReview) without submitting, clear the editing reference and draft so a later
   // unrelated submission doesn't accidentally delete the original entry being edited.
   const FILED_FLOW_SCREENS = ["filedTimes","filedVehicle","filedSite","filedService","filedJobsheet","filedReview","filedTeam"];
+  const LOG_SCREENS = ["fuelLogTeam","fuelLogVehicle","fuelLogView","jobLogTeam","jobLogView","personnelLog","personnelLogDetail","logsHome"];
   useEffect(() => {
     if (!FILED_FLOW_SCREENS.includes(screen)) {
       if (editingFiledEntry) setEditingFiledEntry(null);
-      // Only clear filedDraft if we're not on a screen that legitimately uses it
-      // (avoids clearing it mid-flow on the very first render)
+    }
+    // When navigating to landing, clear log filter state so fuelLogVehicle/fuelLogView
+    // are correctly invalidated by screenIsValid and can't bleed through
+    if (screen === "landing") {
+      setLogTeamFilter(null);
+      setLogVehicleName(null);
+      setLogPersonName(null);
     }
   }, [screen]);
 
@@ -1552,6 +1558,8 @@ export default function AimflowMasterApp() {
       case "reviewReject": return !!reviewTarget;
       case "fuelVehicle": return !!fuelDraft.team;
       case "fuelDetails": return !!fuelDraft.vehicle;
+      case "fuelLogVehicle": return !!logTeamFilter;
+      case "fuelLogView": return !!logVehicleName;
       case "editEntry": return !!editTarget && !!editDraft;
       case "entryDeleteConfirm": return !!entryDeleteTarget;
       case "deleteConfirm": return !!deleteTarget;
@@ -1559,9 +1567,9 @@ export default function AimflowMasterApp() {
       case "adminPinEdit": return !!pinEditTarget;
       case "leavePost": return leaveDraft !== null;
       case "personnelLogDetail": return !!logPersonName;
-      default: return true; // screens with no draft/target requirement are always valid
+      default: return true;
     }
-  }, [filedDraft, reviewTarget, fuelDraft, editTarget, editDraft, entryDeleteTarget, deleteTarget, newUserDraft, pinEditTarget, leaveDraft]);
+  }, [filedDraft, reviewTarget, fuelDraft, editTarget, editDraft, entryDeleteTarget, deleteTarget, newUserDraft, pinEditTarget, leaveDraft, logTeamFilter, logVehicleName, logPersonName]);
   const goBack = useCallback((fallback) => {
     setScreenRaw(() => {
       let hist = screenHistoryRef.current;
@@ -1609,6 +1617,8 @@ export default function AimflowMasterApp() {
 
   // ── Seed vehicles to Firestore on first load (from the original hardcoded lists,
   //    minus the generic "Others" entry which stays as a built-in option, not a managed vehicle) ──
+  // IMPORTANT: dependency array is [] (run once on mount only). Do NOT add remoteVehicles.length
+  // here — doing so causes re-seeding every time a vehicle is deleted, duplicating entries.
   useEffect(() => {
     if (!vehiclesLoading && remoteVehicles.length === 0) {
       const seedList = [
@@ -1620,9 +1630,11 @@ export default function AimflowMasterApp() {
       seedList.forEach(v => batch.set(doc(collection(db, COL.vehicles)), v));
       batch.commit().catch(e => console.error("Seed vehicles:", e));
     }
-  }, [vehiclesLoading, remoteVehicles.length]);
+  }, []);
 
   // ── Seed service types to Firestore on first load (from hardcoded lists + Portable Grease Trap) ──
+  // IMPORTANT: dependency array is [] (run once on mount only). Do NOT add remoteServices.length
+  // here — doing so causes re-seeding every time a service type is deleted, duplicating entries.
   useEffect(() => {
     if (!servicesLoading && remoteServices.length === 0) {
       const seedList = [
@@ -1635,7 +1647,7 @@ export default function AimflowMasterApp() {
       seedList.forEach(s => batch.set(doc(collection(db, COL.services)), s));
       batch.commit().catch(e => console.error("Seed services:", e));
     }
-  }, [servicesLoading, remoteServices.length]);
+  }, []);
 
   const isBeta = session?.role === "beta";
   const myActiveJobsAll = isBeta ? betaActiveJobs : activeJobs;
@@ -3812,23 +3824,34 @@ export default function AimflowMasterApp() {
           isAdminOrSup={isAdminOrSup}
           renderJob={(j) => {
             const dayType=getDayType(j.checkInTime); const ot=calcOT(j.checkInTime,j.checkOutTime); const premium=isPremiumDay(dayType);
+            const allPeople = [...new Set(j.crew||[])];
             return (
               <div>
+                {j.wasFiledEntry && <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:10, padding:"6px 10px", background:"#FEF0E6", borderRadius:8, color:"#C2570C", fontSize:11, fontWeight:700 }}><FileClock size={13} /> Filed entry — approved by {j.approvedBy||"supervisor"}</div>}
                 <div style={{ display:"flex", gap:6, marginBottom:8, flexWrap:"wrap" }}>
                   <span style={{ fontSize:11, fontWeight:700, padding:"3px 9px", borderRadius:7, background:CANVAS, color:"#374151", display:"inline-flex", alignItems:"center", gap:5 }}><TeamIcon team={j.team} size={12} color={teamAccent(j.team)} /> {teamLabel(j.team)}</span>
                   <span style={{ fontSize:11, color:premium?RED:SLATE_LIGHT, fontWeight:premium?700:400, marginLeft:"auto" }}>{dayType}</span>
                 </div>
                 <div style={{ fontSize:14.5, fontWeight:700, color:INK, marginBottom:2 }}>{j.jobSite}</div>
-                <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
+                <div style={{ fontSize:12, color:SLATE, marginBottom:8 }}>
                   {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
                   {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
                   {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
                   {j.checker!==involvedTarget&&` · checked in by ${j.checker}`}
                 </div>
+                {j.vehicles?.length>0 && <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:8 }}>{j.vehicles.map((v)=><span key={v} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}><Truck size={11} color="#6B7280" />{v}</span>)}</div>}
+                {allPeople.length > 0 && (
+                  <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:8 }}>
+                    {allPeople.map((person)=>(
+                      <span key={person} style={{ fontSize:11.5, fontWeight:600, padding:"4px 9px", borderRadius:7, background:person===involvedTarget?BLUE_LIGHT:CANVAS, color:person===involvedTarget?BLUE:INK }}>{person}</span>
+                    ))}
+                  </div>
+                )}
                 <div style={{ display:"flex", gap:6 }}>
                   <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{j.hours} hrs</span>
                   {otVisible?(ot>0&&<span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:premium?RED_LIGHT:GREEN_LIGHT, color:premium?RED:GREEN_DARK }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span>):<span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:SLATE_LIGHT, display:"flex", alignItems:"center", gap:4 }}><Lock size={10} /> OT hidden</span>}
                 </div>
+                <JobDetailDropdown job={j} />
               </div>
             );
           }}
