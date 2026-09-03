@@ -978,7 +978,10 @@ function FuelStatusCard({ lastFillUp, fuelHistory }) {
 // ── Job detail dropdown ──────────────────────────────────────────────
 function JobDetailDropdown({ job: j }) {
   const [open, setOpen] = useState(false);
-  if (!j.jobsheet && !j.pubDisposal && !j.remarks && !(j.serviceLines?.length)) return null;
+  const hasCheckInLoc = j.checkInLat && j.checkInLng;
+  const hasCheckOutLoc = j.checkOutLat && j.checkOutLng;
+  const hasDetails = j.jobsheet || j.pubDisposal || j.remarks || j.serviceLines?.length || hasCheckInLoc || hasCheckOutLoc || j.checkInLocationStatus === "unavailable" || j.checkOutLocationStatus === "unavailable";
+  if (!hasDetails) return null;
   return (
     <div style={{ marginTop:10 }}>
       <button onClick={() => setOpen(!open)} style={{ background:"none", border:"none", color:BLUE, fontSize:12, fontWeight:600, cursor:"pointer", padding:0 }}>
@@ -986,6 +989,25 @@ function JobDetailDropdown({ job: j }) {
       </button>
       {open && (
         <div style={{ marginTop:8, fontSize:12, color:SLATE, lineHeight:1.7 }}>
+          {/* Location links */}
+          {(hasCheckInLoc || j.checkInLocationStatus) && (
+            <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:2 }}>
+              <strong>Check-in location:</strong>
+              {hasCheckInLoc
+                ? <a href={mapsUrl(j.checkInLat, j.checkInLng)} target="_blank" rel="noopener noreferrer" style={{ color:BLUE, fontWeight:600, textDecoration:"none" }}>📍 View on map{j.checkInAccuracy ? ` (±${j.checkInAccuracy}m)` : ""}</a>
+                : <span style={{ color:SLATE_LIGHT, fontStyle:"italic" }}>Location unavailable</span>
+              }
+            </div>
+          )}
+          {(hasCheckOutLoc || j.checkOutLocationStatus) && (
+            <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:4 }}>
+              <strong>Check-out location:</strong>
+              {hasCheckOutLoc
+                ? <a href={mapsUrl(j.checkOutLat, j.checkOutLng)} target="_blank" rel="noopener noreferrer" style={{ color:BLUE, fontWeight:600, textDecoration:"none" }}>📍 View on map{j.checkOutAccuracy ? ` (±${j.checkOutAccuracy}m)` : ""}</a>
+                : <span style={{ color:SLATE_LIGHT, fontStyle:"italic" }}>Location unavailable</span>
+              }
+            </div>
+          )}
           {j.jobsheet && <div><strong>Jobsheet:</strong> {j.jobsheet}</div>}
           {j.pubDisposal && <div><strong>PUB disposal:</strong> {j.pubDisposal}</div>}
           {j.remarks && <div><strong>Remarks:</strong> {j.remarks}</div>}
@@ -1012,7 +1034,41 @@ function formatGap(ms) {
   return `${m}m`;
 }
 
-// Gap indicator between jobs — "travelling · Xm" within a run, "Not on site · Xh Ym" between runs
+// ── GPS location helper ───────────────────────────────────────────────
+// Returns a Promise that resolves with {lat, lng, accuracy} or rejects
+// with "denied" (permission refused) or "timeout" (no fix in time).
+// Used at check-in and check-out to capture coordinates silently.
+function getLocation() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) { reject("unavailable"); return; }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: Math.round(pos.coords.accuracy) }),
+      (err) => {
+        if (err.code === 1) reject("denied");       // PERMISSION_DENIED
+        else if (err.code === 3) reject("timeout"); // TIMEOUT
+        else reject("timeout");                      // POSITION_UNAVAILABLE — treat as timeout
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  });
+}
+
+// Build a Google Maps URL from lat/lng
+function mapsUrl(lat, lng) {
+  return `https://maps.google.com/?q=${lat},${lng}`;
+}
+
+// Build a Google Maps directions URL for a route through multiple coordinates
+// points = [{lat, lng, label}] in order
+function mapsRouteUrl(points) {
+  const valid = points.filter(p => p.lat && p.lng);
+  if (valid.length === 0) return null;
+  if (valid.length === 1) return mapsUrl(valid[0].lat, valid[0].lng);
+  const origin = `${valid[0].lat},${valid[0].lng}`;
+  const destination = `${valid[valid.length-1].lat},${valid[valid.length-1].lng}`;
+  const waypoints = valid.slice(1, -1).map(p => `${p.lat},${p.lng}`).join("|");
+  return `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${destination}${waypoints?`&waypoints=${waypoints}`:""}`;
+}
 function GapIndicator({ gapMs, isTravelling }) {
   return (
     <div style={{ display:"flex", alignItems:"center", gap:8, padding:"6px 0", marginLeft:12 }}>
@@ -1082,6 +1138,21 @@ function ShiftHeader({ shift, showOT, otVisible, isAdminOrSup, onMergeAbove, onM
               Reset to auto
             </button>
           )}
+          {(() => {
+            // View route button — only if at least one job has check-in coordinates
+            const points = shift.jobs
+              .slice().sort((a,b)=>a.checkInTime-b.checkInTime)
+              .filter(j => j.checkInLat && j.checkInLng)
+              .map(j => ({ lat: j.checkInLat, lng: j.checkInLng, label: j.jobSite }));
+            if (points.length === 0) return null;
+            const url = mapsRouteUrl(points);
+            if (!url) return null;
+            return (
+              <a href={url} target="_blank" rel="noopener noreferrer" style={{ flex:1, padding:"6px 10px", borderRadius:8, border:`1px solid ${GREEN_DARK}44`, background:GREEN_LIGHT, color:GREEN_DARK, fontSize:11, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5, textDecoration:"none" }}>
+                🗺 View route ({points.length} pin{points.length===1?"":"s"})
+              </a>
+            );
+          })()}
         </div>
       )}
     </div>
@@ -1481,6 +1552,7 @@ export default function AimflowMasterApp() {
       setLogTeamFilter(null);
       setLogVehicleName(null);
       setLogPersonName(null);
+      setGpsError(null);
     }
   }, [screen]);
 
@@ -1488,6 +1560,8 @@ export default function AimflowMasterApp() {
   const [draft, setDraft] = useState(emptyDraft());
   const [checkoutDraft, setCheckoutDraft] = useState(emptyCheckout());
   const [lastCompletedJob, setLastCompletedJob] = useState(null);
+  const [gpsLoading, setGpsLoading] = useState(false); // true while waiting for GPS fix
+  const [gpsError, setGpsError] = useState(null); // "denied" if permission refused
   const [fuelDraft, setFuelDraft] = useState(emptyFuelDraft());
   const [logTeamFilter, setLogTeamFilter] = useState(null);
   const [logPersonName, setLogPersonName] = useState(null);
@@ -1726,7 +1800,7 @@ export default function AimflowMasterApp() {
 
   // ── CSV / PDF ─────────────────────────────────────────────────────
   function exportCSV(data,filename){if(!data.length)return;const keys=Object.keys(data[0]);const rows=[keys.join(","),...data.map(r=>keys.map(k=>`"${String(r[k]||"").replace(/"/g,'""')}"`).join(","))];const blob=new Blob([rows.join("\n")],{type:"text/csv"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=filename;a.click();URL.revokeObjectURL(url);}
-  function exportJobsCSV(jobs){exportCSV(jobs.map(j=>({Date:j.checkInTime?new Date(j.checkInTime).toLocaleDateString("en-SG"):"",CheckIn:j.checkInTime?new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"}):"",CheckOut:j.checkOutTime?new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"}):"",Team:teamLabel(j.team),JobSite:j.jobSite,CheckedInBy:j.checker,Crew:(j.crew||[]).join("; "),Vehicles:(j.vehicles||[]).join("; "),Hours:j.hours,OT_Hours:calcOT(j.checkInTime,j.checkOutTime).toFixed(1),DayType:getDayType(j.checkInTime),Services:(j.serviceLines||[]).map(l=>`${l.type}${l.qty?` x${l.qty}`:""}${l.freq?` (${l.freq})`:""}${l.levels?.length?` [${l.levels.join(",")}]`:""}${l.detail?` - ${l.detail}`:""}`).join("; "),Jobsheet:j.jobsheet||"",PUB_Disposal:j.pubDisposal||"",Remarks:j.remarks||"",Filed_Entry:j.wasFiledEntry?"Yes":"No",Filed_Reason:j.filedReason||""})),`opsflow_jobs_${sgToday()}.csv`);}
+  function exportJobsCSV(jobs){exportCSV(jobs.map(j=>({Date:j.checkInTime?new Date(j.checkInTime).toLocaleDateString("en-SG"):"",CheckIn:j.checkInTime?new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"}):"",CheckOut:j.checkOutTime?new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"}):"",Team:teamLabel(j.team),JobSite:j.jobSite,CheckedInBy:j.checker,Crew:(j.crew||[]).join("; "),Vehicles:(j.vehicles||[]).join("; "),Hours:j.hours,OT_Hours:calcOT(j.checkInTime,j.checkOutTime).toFixed(1),DayType:getDayType(j.checkInTime),Services:(j.serviceLines||[]).map(l=>`${l.type}${l.qty?` x${l.qty}`:""}${l.freq?` (${l.freq})`:""}${l.levels?.length?` [${l.levels.join(",")}]`:""}${l.detail?` - ${l.detail}`:""}`).join("; "),Jobsheet:j.jobsheet||"",PUB_Disposal:j.pubDisposal||"",Remarks:j.remarks||"",Filed_Entry:j.wasFiledEntry?"Yes":"No",Filed_Reason:j.filedReason||"",CheckIn_Location:(j.checkInLat&&j.checkInLng)?mapsUrl(j.checkInLat,j.checkInLng):(j.checkInLocationStatus==="unavailable"?"Location unavailable":""),CheckOut_Location:(j.checkOutLat&&j.checkOutLng)?mapsUrl(j.checkOutLat,j.checkOutLng):(j.checkOutLocationStatus==="unavailable"?"Location unavailable":"")})),`opsflow_jobs_${sgToday()}.csv`);}
   function exportFuelCSV(fuel){exportCSV(fuel.map(f=>({Date:f.date?new Date(f.date).toLocaleDateString("en-SG"):"",Time:f.date?new Date(f.date).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"}):"",Team:teamLabel(f.team),Person:f.person,Vehicle:f.vehicle,Company:f.company,Litres:f.amount,Price_SGD:f.price,Mileage_km:f.mileage,Aux_Mileage_km:f.mileageAux||"",Tank:f.tank||"",Cost_Per_Litre:f.amount&&f.price?(parseFloat(f.price)/parseFloat(f.amount)).toFixed(3):""})),`opsflow_fuel_${sgToday()}.csv`);}
   function exportPDF(jobs,fuel){const win=window.open("","_blank");const today=new Date().toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"});const jobRows=jobs.map(j=>`<tr><td>${j.checkInTime?new Date(j.checkInTime).toLocaleDateString("en-SG"):""}</td><td>${teamLabel(j.team)}</td><td>${j.jobSite}</td><td>${j.checker}</td><td>${(j.crew||[]).join(", ")}</td><td>${(j.serviceLines||[]).map(l=>`${l.type}${l.qty?` x${l.qty}`:""}`).join("; ")}</td><td>${j.hours}</td><td>${calcOT(j.checkInTime,j.checkOutTime).toFixed(1)}</td><td>${j.jobsheet||""}</td></tr>`).join("");const fuelRows=fuel.map(f=>`<tr><td>${f.date?new Date(f.date).toLocaleDateString("en-SG"):""}</td><td>${teamLabel(f.team)}</td><td>${f.person}</td><td>${f.vehicle}</td><td>${f.company}</td><td>${f.amount}L</td><td>S$${f.price}</td><td>${f.amount&&f.price?(parseFloat(f.price)/parseFloat(f.amount)).toFixed(3):""}</td></tr>`).join("");win.document.write(`<!DOCTYPE html><html><head><title>Opsflow Export ${today}</title><style>body{font-family:Arial,sans-serif;font-size:10px;padding:16px}h1{font-size:14px}h2{font-size:12px;margin-top:20px}table{width:100%;border-collapse:collapse;margin-top:6px}th,td{border:1px solid #ddd;padding:4px 6px;text-align:left}th{background:#f0f4ff}tr:nth-child(even){background:#fafafa}</style></head><body><h1>Opsflow — Aimflow Pte Ltd</h1><p>Exported: ${today}</p><h2>Jobs (${jobs.length})</h2><table><tr><th>Date</th><th>Team</th><th>Site</th><th>Checker</th><th>Crew</th><th>Services</th><th>Hrs</th><th>OT</th><th>Jobsheet</th></tr>${jobRows}</table><h2>Fuel (${fuel.length})</h2><table><tr><th>Date</th><th>Team</th><th>Person</th><th>Vehicle</th><th>Station</th><th>Amount</th><th>Price</th><th>$/L</th></tr>${fuelRows}</table></body></html>`);win.document.close();win.print();}
 
@@ -2767,10 +2841,37 @@ export default function AimflowMasterApp() {
             <span>⚠️ You already have a job logged at this site today. Are you sure this is a different job?</span>
           </div>
         )}
-        <PrimaryButton accent={accent} disabled={!draft.jobSite?.trim()} onClick={()=>{
+        {gpsError === "denied" && (
+          <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}>
+            <AlertTriangle size={16} style={{ flexShrink:0, marginTop:1 }} />
+            <span><strong>Location access required.</strong> Please enable location permissions for Opsflow in your phone settings, then try again.</span>
+          </div>
+        )}
+        <PrimaryButton accent={accent} disabled={!draft.jobSite?.trim() || gpsLoading || gpsError === "denied"} onClick={async ()=>{
+          setGpsLoading(true);
+          setGpsError(null);
+          let locationData = null;
+          let locationStatus = "unavailable";
+          try {
+            locationData = await getLocation();
+            locationStatus = "ok";
+          } catch(err) {
+            if (err === "denied") {
+              setGpsLoading(false);
+              setGpsError("denied");
+              return; // hard block — must enable permissions
+            }
+            // timeout or unavailable — allow check-in anyway
+            locationStatus = "unavailable";
+          }
+          setGpsLoading(false);
           const checkInTime = nowFn();
-          const checkinRecord = { ...draft, checkInTime, id:`active-${Date.now()}` };
-          // Resolve crew: replace CASUAL_LABOUR_OPTION sentinel with actual names
+          const checkinRecord = { ...draft, checkInTime, id:`active-${Date.now()}`,
+            checkInLat: locationData?.lat || null,
+            checkInLng: locationData?.lng || null,
+            checkInAccuracy: locationData?.accuracy || null,
+            checkInLocationStatus: locationStatus,
+          };
           const rawCrew = [...new Set(Object.values(draft.crewByVehicle||{}).flat())];
           const casualNames = Object.values(draft.crewCustomNames||{}).flat().map((n)=>n.trim()).filter(Boolean);
           const allCrew = [...rawCrew.filter((n)=>n!==CASUAL_LABOUR_OPTION), ...casualNames];
@@ -2780,7 +2881,7 @@ export default function AimflowMasterApp() {
           setDraft(emptyDraft());
           setScreen("checkinDone");
         }}>
-          <Check size={16} /> Confirm check-in
+          {gpsLoading ? "Getting location…" : <><Check size={16} /> Confirm check-in</>}
         </PrimaryButton>
       </Shell>
     );
@@ -2923,7 +3024,29 @@ export default function AimflowMasterApp() {
           ["Remarks", checkoutDraft.remarks||"NIL"],
           ["Hours on site", `${hours} hrs`],
         ]} />
-        <PrimaryButton accent={accent} onClick={()=>{
+        {gpsError === "denied" && (
+          <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}>
+            <AlertTriangle size={16} style={{ flexShrink:0, marginTop:1 }} />
+            <span><strong>Location access required.</strong> Please enable location permissions for Opsflow in your phone settings, then try again.</span>
+          </div>
+        )}
+        <PrimaryButton accent={accent} disabled={gpsLoading || gpsError === "denied"} onClick={async ()=>{
+          setGpsLoading(true);
+          setGpsError(null);
+          let locationData = null;
+          let locationStatus = "unavailable";
+          try {
+            locationData = await getLocation();
+            locationStatus = "ok";
+          } catch(err) {
+            if (err === "denied") {
+              setGpsLoading(false);
+              setGpsError("denied");
+              return;
+            }
+            locationStatus = "unavailable";
+          }
+          setGpsLoading(false);
           const completed = {
             id:`job-${Date.now()}`, team:myActiveJob.team, jobSite:myActiveJob.jobSite, checker:myActiveJob.checker,
             checkInTime:myActiveJob.checkInTime, checkOutTime, hours,
@@ -2931,6 +3054,16 @@ export default function AimflowMasterApp() {
             crewByVehicle:myActiveJob.crewByVehicle||{},
             serviceLines:checkoutDraft.serviceLines, jobsheet:checkoutDraft.jobsheet,
             pubDisposal:checkoutDraft.pubDisposal, remarks:checkoutDraft.remarks,
+            // Check-in location (carried from active job record)
+            checkInLat: myActiveJob.checkInLat || null,
+            checkInLng: myActiveJob.checkInLng || null,
+            checkInAccuracy: myActiveJob.checkInAccuracy || null,
+            checkInLocationStatus: myActiveJob.checkInLocationStatus || "unavailable",
+            // Check-out location (just captured)
+            checkOutLat: locationData?.lat || null,
+            checkOutLng: locationData?.lng || null,
+            checkOutAccuracy: locationData?.accuracy || null,
+            checkOutLocationStatus: locationStatus,
           };
           if (isBeta) { setBetaJobHistory((p)=>[completed,...p]); setBetaActiveJobs((p)=>p.filter((j)=>j.checker!==session.name)); }
           else { addJob(completed); clearActiveJob(session.name); }
@@ -2938,7 +3071,7 @@ export default function AimflowMasterApp() {
           setLastCompletedJob(completed);
           setScreen("checkoutDone");
         }}>
-          <Check size={16} /> Confirm check-out
+          {gpsLoading ? "Getting location…" : <><Check size={16} /> Confirm check-out</>}
         </PrimaryButton>
       </Shell>
     );
