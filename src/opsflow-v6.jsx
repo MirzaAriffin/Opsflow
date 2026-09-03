@@ -743,7 +743,6 @@ function Shell({ children }) {
         )}
         {children}
       </div>
-      <ScrollToTopButton />
     </div>
   );
 }
@@ -1044,34 +1043,6 @@ function LocationFlagBadge({ job }) {
 }
 
 // ── Floating scroll-to-top button ────────────────────────────────────
-function ScrollToTopButton() {
-  const [visible, setVisible] = React.useState(false);
-  React.useEffect(() => {
-    const onScroll = () => setVisible(window.scrollY > 300);
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
-  }, []);
-  if (!visible) return null;
-  return (
-    <button
-      onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
-      style={{
-        position:"fixed", bottom:24, right:20, zIndex:9999,
-        width:44, height:44, borderRadius:"50%",
-        background:NAVY, border:"none", cursor:"pointer",
-        display:"flex", alignItems:"center", justifyContent:"center",
-        boxShadow:"0 4px 16px rgba(0,0,0,0.25)",
-        opacity: visible ? 1 : 0,
-        transition:"opacity 0.2s",
-      }}
-      aria-label="Scroll to top"
-    >
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-        <polyline points="18 15 12 9 6 15"/>
-      </svg>
-    </button>
-  );
-}
 // Formats a gap duration in ms as "Xh Ym" or "Zm"
 function formatGap(ms) {
   const totalMin = Math.round(ms / 60000);
@@ -2753,15 +2724,26 @@ export default function AimflowMasterApp() {
           <div style={{ textAlign:"center", padding:"20px 0" }}>
             {gpsError === "denied" ? (
               <>
-                <AlertTriangle size={40} color={AMBER} />
-                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px", color:AMBER_DARK }}>Location permission blocked</div>
-                <div style={{ fontSize:13, color:SLATE, marginBottom:16, textAlign:"left", lineHeight:1.6 }}>
-                  Your browser has blocked location access. To re-enable it:<br/><br/>
-                  <strong>Chrome/Android:</strong> Tap the 🔒 lock icon in the address bar → Site settings → Location → Allow<br/><br/>
-                  <strong>Safari/iPhone:</strong> Go to Settings → Safari → Location → Allow
+                <AlertTriangle size={40} color={RED} />
+                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px", color:RED }}>Location access required</div>
+                <div style={{ fontSize:13, color:SLATE, marginBottom:16, lineHeight:1.6 }}>
+                  Opsflow needs your location to check in. Please allow location access when prompted, then tap Try Again.
+                  <br/><br/>
+                  If the prompt doesn't appear, go to your browser settings and allow location for this site.
                 </div>
                 <div style={{ display:"flex", flexDirection:"column", gap:8, width:"100%" }}>
-                  <PrimaryButton accent={accent} onClick={()=>{setGpsError(null); setDraft({...draft, gpsCaptured:false});}}>Try again</PrimaryButton>
+                  <PrimaryButton accent={accent} disabled={gpsLoading} onClick={async ()=>{
+                    setGpsError(null);
+                    setGpsLoading(true);
+                    try {
+                      const loc = await getLocation();
+                      setDraft({...draft, gpsCaptured:true, checkInLat:loc.lat, checkInLng:loc.lng, checkInAccuracy:loc.accuracy, checkInLocationStatus:"ok"});
+                    } catch(err) {
+                      if (err === "denied") setGpsError("denied");
+                      else setDraft({...draft, gpsCaptured:true, checkInLat:null, checkInLng:null, checkInAccuracy:null, checkInLocationStatus:"unavailable"});
+                    }
+                    setGpsLoading(false);
+                  }}>{gpsLoading ? "Getting location…" : "Try Again"}</PrimaryButton>
                   <button onClick={()=>{
                     setDraft({...draft, gpsCaptured:true, checkInLat:null, checkInLng:null, checkInAccuracy:null, checkInLocationStatus:"denied"});
                     setGpsError(null);
@@ -3041,15 +3023,26 @@ export default function AimflowMasterApp() {
           <div style={{ textAlign:"center", padding:"20px 0" }}>
             {gpsError === "denied" ? (
               <>
-                <AlertTriangle size={40} color={AMBER} />
-                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px", color:AMBER_DARK }}>Location permission blocked</div>
-                <div style={{ fontSize:13, color:SLATE, marginBottom:16, textAlign:"left", lineHeight:1.6 }}>
-                  Your browser has blocked location access. To re-enable it:<br/><br/>
-                  <strong>Chrome/Android:</strong> Tap the 🔒 lock icon in the address bar → Site settings → Location → Allow<br/><br/>
-                  <strong>Safari/iPhone:</strong> Go to Settings → Safari → Location → Allow
+                <AlertTriangle size={40} color={RED} />
+                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px", color:RED }}>Location access required</div>
+                <div style={{ fontSize:13, color:SLATE, marginBottom:16, lineHeight:1.6 }}>
+                  Opsflow needs your location to check out. Please allow location access when prompted, then tap Try Again.
+                  <br/><br/>
+                  If the prompt doesn't appear, go to your browser settings and allow location for this site.
                 </div>
                 <div style={{ display:"flex", flexDirection:"column", gap:8, width:"100%" }}>
-                  <PrimaryButton accent={accent} onClick={()=>setGpsError(null)}>Try again</PrimaryButton>
+                  <PrimaryButton accent={accent} disabled={gpsLoading} onClick={async ()=>{
+                    setGpsError(null);
+                    setGpsLoading(true);
+                    try {
+                      const loc = await getLocation();
+                      setCheckoutDraft({...checkoutDraft, checkOutLat:loc.lat, checkOutLng:loc.lng, checkOutAccuracy:loc.accuracy, checkOutLocationStatus:"ok"});
+                    } catch(err) {
+                      if (err === "denied") setGpsError("denied");
+                      else setCheckoutDraft({...checkoutDraft, checkOutLat:null, checkOutLng:null, checkOutAccuracy:null, checkOutLocationStatus:"unavailable"});
+                    }
+                    setGpsLoading(false);
+                  }}>{gpsLoading ? "Getting location…" : "Try Again"}</PrimaryButton>
                   <button onClick={()=>{
                     setCheckoutDraft({...checkoutDraft, checkOutLat:null, checkOutLng:null, checkOutAccuracy:null, checkOutLocationStatus:"denied"});
                     setGpsError(null);
