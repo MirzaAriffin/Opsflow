@@ -718,7 +718,6 @@ function Shell({ children }) {
   const safeBottom = "calc(env(safe-area-inset-bottom, 0px) + 16px)";
   return (
     <div ref={shellRef} style={{ minHeight:"100vh", background:CANVAS, fontFamily:"'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", display:"flex", justifyContent:"center", paddingTop:safeTop, paddingBottom:safeBottom, paddingLeft:"env(safe-area-inset-left, 0px)", paddingRight:"env(safe-area-inset-right, 0px)" }}>
-      <ScrollToTopButton />
       <div style={{ width:"100%", maxWidth:420, padding:"16px 16px 40px", position:"relative", transform: pullDistance > 0 ? `translateY(${pullDistance}px)` : "none", transition: pullDistance === 0 ? "transform 0.25s ease-out" : "none" }}>
         <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
         {(pullDistance > 0 || refreshed) && (
@@ -744,6 +743,7 @@ function Shell({ children }) {
         )}
         {children}
       </div>
+      <ScrollToTopButton />
     </div>
   );
 }
@@ -2753,10 +2753,22 @@ export default function AimflowMasterApp() {
           <div style={{ textAlign:"center", padding:"20px 0" }}>
             {gpsError === "denied" ? (
               <>
-                <AlertTriangle size={40} color={RED} />
-                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px", color:RED }}>Location access denied</div>
-                <div style={{ fontSize:13, color:SLATE, marginBottom:16 }}>Please enable location permissions for Opsflow in your phone settings, then try again.</div>
-                <PrimaryButton accent={RED} onClick={()=>{setGpsError(null);}}>Try again</PrimaryButton>
+                <AlertTriangle size={40} color={AMBER} />
+                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px", color:AMBER_DARK }}>Location permission blocked</div>
+                <div style={{ fontSize:13, color:SLATE, marginBottom:16, textAlign:"left", lineHeight:1.6 }}>
+                  Your browser has blocked location access. To re-enable it:<br/><br/>
+                  <strong>Chrome/Android:</strong> Tap the 🔒 lock icon in the address bar → Site settings → Location → Allow<br/><br/>
+                  <strong>Safari/iPhone:</strong> Go to Settings → Safari → Location → Allow
+                </div>
+                <div style={{ display:"flex", flexDirection:"column", gap:8, width:"100%" }}>
+                  <PrimaryButton accent={accent} onClick={()=>{setGpsError(null); setDraft({...draft, gpsCaptured:false});}}>Try again</PrimaryButton>
+                  <button onClick={()=>{
+                    setDraft({...draft, gpsCaptured:true, checkInLat:null, checkInLng:null, checkInAccuracy:null, checkInLocationStatus:"denied"});
+                    setGpsError(null);
+                  }} style={{ width:"100%", padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>
+                    Continue without location
+                  </button>
+                </div>
               </>
             ) : !draft.gpsCaptured ? (
               <>
@@ -3029,10 +3041,23 @@ export default function AimflowMasterApp() {
           <div style={{ textAlign:"center", padding:"20px 0" }}>
             {gpsError === "denied" ? (
               <>
-                <AlertTriangle size={40} color={RED} />
-                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px", color:RED }}>Location access denied</div>
-                <div style={{ fontSize:13, color:SLATE, marginBottom:16 }}>Please enable location permissions for Opsflow in your phone settings, then try again.</div>
-                <PrimaryButton accent={RED} onClick={()=>setGpsError(null)}>Try again</PrimaryButton>
+                <AlertTriangle size={40} color={AMBER} />
+                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px", color:AMBER_DARK }}>Location permission blocked</div>
+                <div style={{ fontSize:13, color:SLATE, marginBottom:16, textAlign:"left", lineHeight:1.6 }}>
+                  Your browser has blocked location access. To re-enable it:<br/><br/>
+                  <strong>Chrome/Android:</strong> Tap the 🔒 lock icon in the address bar → Site settings → Location → Allow<br/><br/>
+                  <strong>Safari/iPhone:</strong> Go to Settings → Safari → Location → Allow
+                </div>
+                <div style={{ display:"flex", flexDirection:"column", gap:8, width:"100%" }}>
+                  <PrimaryButton accent={accent} onClick={()=>setGpsError(null)}>Try again</PrimaryButton>
+                  <button onClick={()=>{
+                    setCheckoutDraft({...checkoutDraft, checkOutLat:null, checkOutLng:null, checkOutAccuracy:null, checkOutLocationStatus:"denied"});
+                    setGpsError(null);
+                    setScreen("checkoutDetails");
+                  }} style={{ width:"100%", padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>
+                    Continue without location
+                  </button>
+                </div>
               </>
             ) : !checkoutDraft.checkOutLocationStatus ? (
               <>
