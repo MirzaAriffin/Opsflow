@@ -328,8 +328,8 @@ function mileageDeltaFor(fillUp, allFuelHistory) {
 }
 
 // ── Empty drafts ─────────────────────────────────────────────────────
-const emptyDraft = ()=>({team:null,checker:null,gpsCaptured:false,manualCheckIn:"",vehicles:[],crewByVehicle:{},crewCustomNames:{},vehicleCustomPlates:{}});
-const emptyCheckout = ()=>({serviceLines:[{type:"",qty:"",freq:"",levels:[],detail:""}],jobsheet:"",pubDisposal:"",remarks:"",manualCheckOut:""});
+const emptyDraft = ()=>({team:null,checker:null,gpsCaptured:false,manualCheckIn:"",vehicles:[],crewByVehicle:{},crewCustomNames:{},vehicleCustomPlates:{},checkInLat:null,checkInLng:null,checkInAccuracy:null,checkInLocationStatus:null});
+const emptyCheckout = ()=>({serviceLines:[{type:"",qty:"",freq:"",levels:[],detail:""}],jobsheet:"",pubDisposal:"",remarks:"",manualCheckOut:"",checkOutLat:null,checkOutLng:null,checkOutAccuracy:null,checkOutLocationStatus:null});
 const emptyFuelDraft = ()=>({team:null,person:null,vehicle:null,company:null,companyCustom:"",amount:"",price:"",mileage:"",mileageAux:"",tank:null});
 const emptyFiledDraft = ()=>({team:null,manualCheckIn:"",manualCheckOut:"",vehicles:[],crewByVehicle:{},crewCustomNames:{},vehicleCustomPlates:{},jobSite:"",serviceLines:[{type:"",qty:"",freq:"",levels:[],detail:""}],jobsheet:"",pubDisposal:"",remarks:"",reason:""});
 
@@ -718,6 +718,7 @@ function Shell({ children }) {
   const safeBottom = "calc(env(safe-area-inset-bottom, 0px) + 16px)";
   return (
     <div ref={shellRef} style={{ minHeight:"100vh", background:CANVAS, fontFamily:"'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif", display:"flex", justifyContent:"center", paddingTop:safeTop, paddingBottom:safeBottom, paddingLeft:"env(safe-area-inset-left, 0px)", paddingRight:"env(safe-area-inset-right, 0px)" }}>
+      <ScrollToTopButton />
       <div style={{ width:"100%", maxWidth:420, padding:"16px 16px 40px", position:"relative", transform: pullDistance > 0 ? `translateY(${pullDistance}px)` : "none", transition: pullDistance === 0 ? "transform 0.25s ease-out" : "none" }}>
         <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
         {(pullDistance > 0 || refreshed) && (
@@ -1023,7 +1024,54 @@ function JobDetailDropdown({ job: j }) {
   );
 }
 
-// ── Shift grouping visual components (Session 7) ──────────────────────
+// ── Location flag badge ───────────────────────────────────────────────
+// Shows amber/red distance badge on job cards when check-out is far from check-in
+function LocationFlagBadge({ job }) {
+  const { flag, distanceM } = computeLocationFlag(job);
+  if (!flag || flag === "ok") return null;
+  const isRed = flag === "red";
+  return (
+    <span style={{
+      display:"inline-flex", alignItems:"center", gap:4,
+      fontSize:10.5, fontWeight:700, padding:"2px 8px", borderRadius:6,
+      background: isRed ? RED_LIGHT : AMBER_LIGHT,
+      color: isRed ? RED : AMBER_DARK,
+      border: `1px solid ${isRed ? RED : AMBER}44`,
+    }}>
+      {isRed ? "🔴" : "🟡"} {formatDistance(distanceM)} from check-in
+    </span>
+  );
+}
+
+// ── Floating scroll-to-top button ────────────────────────────────────
+function ScrollToTopButton() {
+  const [visible, setVisible] = React.useState(false);
+  React.useEffect(() => {
+    const onScroll = () => setVisible(window.scrollY > 300);
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+  if (!visible) return null;
+  return (
+    <button
+      onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+      style={{
+        position:"fixed", bottom:24, right:20, zIndex:9999,
+        width:44, height:44, borderRadius:"50%",
+        background:NAVY, border:"none", cursor:"pointer",
+        display:"flex", alignItems:"center", justifyContent:"center",
+        boxShadow:"0 4px 16px rgba(0,0,0,0.25)",
+        opacity: visible ? 1 : 0,
+        transition:"opacity 0.2s",
+      }}
+      aria-label="Scroll to top"
+    >
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+        <polyline points="18 15 12 9 6 15"/>
+      </svg>
+    </button>
+  );
+}
 // Formats a gap duration in ms as "Xh Ym" or "Zm"
 function formatGap(ms) {
   const totalMin = Math.round(ms / 60000);
@@ -1053,7 +1101,35 @@ function getLocation() {
   });
 }
 
-// Build a Google Maps URL from lat/lng
+// Haversine formula — distance in metres between two GPS coordinates
+function haversineDistance(lat1, lng1, lat2, lng2) {
+  const R = 6371000; // Earth radius in metres
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δφ = (lat2 - lat1) * Math.PI / 180;
+  const Δλ = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(Δφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(Δλ/2)**2;
+  return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)));
+}
+
+// Compute location flag based on distance between check-in and check-out
+// Returns { flag: "ok"|"amber"|"red", distanceM: number|null }
+function computeLocationFlag(job) {
+  if (!job.checkInLat || !job.checkInLng || !job.checkOutLat || !job.checkOutLng) {
+    return { flag: null, distanceM: null };
+  }
+  const distanceM = haversineDistance(job.checkInLat, job.checkInLng, job.checkOutLat, job.checkOutLng);
+  if (distanceM <= 200) return { flag: "ok", distanceM };
+  if (distanceM <= 1000) return { flag: "amber", distanceM };
+  return { flag: "red", distanceM };
+}
+
+// Format distance for display
+function formatDistance(m) {
+  if (m === null) return null;
+  if (m < 1000) return `${m}m`;
+  return `${(m/1000).toFixed(1)}km`;
+}
 function mapsUrl(lat, lng) {
   return `https://maps.google.com/?q=${lat},${lng}`;
 }
@@ -1560,8 +1636,9 @@ export default function AimflowMasterApp() {
   const [draft, setDraft] = useState(emptyDraft());
   const [checkoutDraft, setCheckoutDraft] = useState(emptyCheckout());
   const [lastCompletedJob, setLastCompletedJob] = useState(null);
-  const [gpsLoading, setGpsLoading] = useState(false); // true while waiting for GPS fix
-  const [gpsError, setGpsError] = useState(null); // "denied" if permission refused
+  const [gpsLoading, setGpsLoading] = useState(false);
+  const [gpsError, setGpsError] = useState(null);
+  const [geofenceWarning, setGeofenceWarning] = useState(null); // { flag, distanceM } when amber/red
   const [fuelDraft, setFuelDraft] = useState(emptyFuelDraft());
   const [logTeamFilter, setLogTeamFilter] = useState(null);
   const [logPersonName, setLogPersonName] = useState(null);
@@ -1632,6 +1709,7 @@ export default function AimflowMasterApp() {
       case "reviewReject": return !!reviewTarget;
       case "fuelVehicle": return !!fuelDraft.team;
       case "fuelDetails": return !!fuelDraft.vehicle;
+      case "checkoutGps": case "checkoutDetails": case "checkoutReview": return !!myActiveJob;
       case "fuelLogVehicle": return !!logTeamFilter;
       case "fuelLogView": return !!logVehicleName;
       case "editEntry": return !!editTarget && !!editDraft;
@@ -1800,7 +1878,7 @@ export default function AimflowMasterApp() {
 
   // ── CSV / PDF ─────────────────────────────────────────────────────
   function exportCSV(data,filename){if(!data.length)return;const keys=Object.keys(data[0]);const rows=[keys.join(","),...data.map(r=>keys.map(k=>`"${String(r[k]||"").replace(/"/g,'""')}"`).join(","))];const blob=new Blob([rows.join("\n")],{type:"text/csv"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=filename;a.click();URL.revokeObjectURL(url);}
-  function exportJobsCSV(jobs){exportCSV(jobs.map(j=>({Date:j.checkInTime?new Date(j.checkInTime).toLocaleDateString("en-SG"):"",CheckIn:j.checkInTime?new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"}):"",CheckOut:j.checkOutTime?new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"}):"",Team:teamLabel(j.team),JobSite:j.jobSite,CheckedInBy:j.checker,Crew:(j.crew||[]).join("; "),Vehicles:(j.vehicles||[]).join("; "),Hours:j.hours,OT_Hours:calcOT(j.checkInTime,j.checkOutTime).toFixed(1),DayType:getDayType(j.checkInTime),Services:(j.serviceLines||[]).map(l=>`${l.type}${l.qty?` x${l.qty}`:""}${l.freq?` (${l.freq})`:""}${l.levels?.length?` [${l.levels.join(",")}]`:""}${l.detail?` - ${l.detail}`:""}`).join("; "),Jobsheet:j.jobsheet||"",PUB_Disposal:j.pubDisposal||"",Remarks:j.remarks||"",Filed_Entry:j.wasFiledEntry?"Yes":"No",Filed_Reason:j.filedReason||"",CheckIn_Location:(j.checkInLat&&j.checkInLng)?mapsUrl(j.checkInLat,j.checkInLng):(j.checkInLocationStatus==="unavailable"?"Location unavailable":""),CheckOut_Location:(j.checkOutLat&&j.checkOutLng)?mapsUrl(j.checkOutLat,j.checkOutLng):(j.checkOutLocationStatus==="unavailable"?"Location unavailable":"")})),`opsflow_jobs_${sgToday()}.csv`);}
+  function exportJobsCSV(jobs){exportCSV(jobs.map(j=>{const {flag,distanceM}=computeLocationFlag(j);return({Date:j.checkInTime?new Date(j.checkInTime).toLocaleDateString("en-SG"):"",CheckIn:j.checkInTime?new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"}):"",CheckOut:j.checkOutTime?new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"}):"",Team:teamLabel(j.team),JobSite:j.jobSite,CheckedInBy:j.checker,Crew:(j.crew||[]).join("; "),Vehicles:(j.vehicles||[]).join("; "),Hours:j.hours,OT_Hours:calcOT(j.checkInTime,j.checkOutTime).toFixed(1),DayType:getDayType(j.checkInTime),Services:(j.serviceLines||[]).map(l=>`${l.type}${l.qty?` x${l.qty}`:""}${l.freq?` (${l.freq})`:""}${l.levels?.length?` [${l.levels.join(",")}]`:""}${l.detail?` - ${l.detail}`:""}`).join("; "),Jobsheet:j.jobsheet||"",PUB_Disposal:j.pubDisposal||"",Remarks:j.remarks||"",Filed_Entry:j.wasFiledEntry?"Yes":"No",Filed_Reason:j.filedReason||"",CheckIn_Location:(j.checkInLat&&j.checkInLng)?mapsUrl(j.checkInLat,j.checkInLng):(j.checkInLocationStatus==="unavailable"?"Location unavailable":""),CheckOut_Location:(j.checkOutLat&&j.checkOutLng)?mapsUrl(j.checkOutLat,j.checkOutLng):(j.checkOutLocationStatus==="unavailable"?"Location unavailable":""),Location_Flag:flag?`${flag.toUpperCase()}${distanceM!==null?` - ${formatDistance(distanceM)} from check-in`:""}` :"",CheckIn_OutDistance_m:distanceM!==null?distanceM:""});}),`opsflow_jobs_${sgToday()}.csv`);}
   function exportFuelCSV(fuel){exportCSV(fuel.map(f=>({Date:f.date?new Date(f.date).toLocaleDateString("en-SG"):"",Time:f.date?new Date(f.date).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"}):"",Team:teamLabel(f.team),Person:f.person,Vehicle:f.vehicle,Company:f.company,Litres:f.amount,Price_SGD:f.price,Mileage_km:f.mileage,Aux_Mileage_km:f.mileageAux||"",Tank:f.tank||"",Cost_Per_Litre:f.amount&&f.price?(parseFloat(f.price)/parseFloat(f.amount)).toFixed(3):""})),`opsflow_fuel_${sgToday()}.csv`);}
   function exportPDF(jobs,fuel){const win=window.open("","_blank");const today=new Date().toLocaleDateString("en-SG",{day:"2-digit",month:"short",year:"numeric"});const jobRows=jobs.map(j=>`<tr><td>${j.checkInTime?new Date(j.checkInTime).toLocaleDateString("en-SG"):""}</td><td>${teamLabel(j.team)}</td><td>${j.jobSite}</td><td>${j.checker}</td><td>${(j.crew||[]).join(", ")}</td><td>${(j.serviceLines||[]).map(l=>`${l.type}${l.qty?` x${l.qty}`:""}`).join("; ")}</td><td>${j.hours}</td><td>${calcOT(j.checkInTime,j.checkOutTime).toFixed(1)}</td><td>${j.jobsheet||""}</td></tr>`).join("");const fuelRows=fuel.map(f=>`<tr><td>${f.date?new Date(f.date).toLocaleDateString("en-SG"):""}</td><td>${teamLabel(f.team)}</td><td>${f.person}</td><td>${f.vehicle}</td><td>${f.company}</td><td>${f.amount}L</td><td>S$${f.price}</td><td>${f.amount&&f.price?(parseFloat(f.price)/parseFloat(f.amount)).toFixed(3):""}</td></tr>`).join("");win.document.write(`<!DOCTYPE html><html><head><title>Opsflow Export ${today}</title><style>body{font-family:Arial,sans-serif;font-size:10px;padding:16px}h1{font-size:14px}h2{font-size:12px;margin-top:20px}table{width:100%;border-collapse:collapse;margin-top:6px}th,td{border:1px solid #ddd;padding:4px 6px;text-align:left}th{background:#f0f4ff}tr:nth-child(even){background:#fafafa}</style></head><body><h1>Opsflow — Aimflow Pte Ltd</h1><p>Exported: ${today}</p><h2>Jobs (${jobs.length})</h2><table><tr><th>Date</th><th>Team</th><th>Site</th><th>Checker</th><th>Crew</th><th>Services</th><th>Hrs</th><th>OT</th><th>Jobsheet</th></tr>${jobRows}</table><h2>Fuel (${fuel.length})</h2><table><tr><th>Date</th><th>Team</th><th>Person</th><th>Vehicle</th><th>Station</th><th>Amount</th><th>Price</th><th>$/L</th></tr>${fuelRows}</table></body></html>`);win.document.close();win.print();}
 
@@ -2659,10 +2737,11 @@ export default function AimflowMasterApp() {
   }
 
   if (screen === "checkinGps") {
+    const accent = teamAccent(draft.team);
     return (
       <Shell>
-        <Header title="Check in" onBack={()=>goBack("checkinoutTeam")} accent={teamAccent(draft.team)} />
-        <ProgressDots step={0} total={3} accent={teamAccent(draft.team)} />
+        <Header title="Check in" onBack={()=>goBack("checkinoutTeam")} accent={accent} />
+        <ProgressDots step={0} total={3} accent={accent} />
         {isBeta ? (
           <div style={{ padding:"12px 0" }}>
             <div style={{ display:"flex", gap:8, background:PURPLE_LIGHT, borderRadius:11, padding:"10px 12px", marginBottom:16, fontSize:12, color:PURPLE }}><ShieldAlert size={15} style={{ flexShrink:0, marginTop:1 }} /><span>Beta mode — set a manual check-in time to simulate OT scenarios.</span></div>
@@ -2672,22 +2751,51 @@ export default function AimflowMasterApp() {
           </div>
         ) : (
           <div style={{ textAlign:"center", padding:"20px 0" }}>
-            {!draft.gpsCaptured ? (
+            {gpsError === "denied" ? (
               <>
-                <MapPin size={40} color={teamAccent(draft.team)} />
+                <AlertTriangle size={40} color={RED} />
+                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px", color:RED }}>Location access denied</div>
+                <div style={{ fontSize:13, color:SLATE, marginBottom:16 }}>Please enable location permissions for Opsflow in your phone settings, then try again.</div>
+                <PrimaryButton accent={RED} onClick={()=>{setGpsError(null);}}>Try again</PrimaryButton>
+              </>
+            ) : !draft.gpsCaptured ? (
+              <>
+                <MapPin size={40} color={accent} />
                 <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px" }}>Confirm your location</div>
                 <div style={{ fontSize:13, color:SLATE, marginBottom:16 }}>We need your GPS to verify you're on site</div>
                 <div style={{ display:"flex", gap:8, background:AMBER_LIGHT, borderRadius:11, padding:"12px 13px", marginBottom:20, fontSize:12, color:AMBER_DARK, textAlign:"left", lineHeight:1.5 }}>
                   <AlertTriangle size={18} style={{ flexShrink:0, marginTop:1 }} />
                   <span><strong>Only check in once you have arrived on site.</strong> Your GPS location and timestamp are recorded. Checking in before arriving is a timestamp violation.</span>
                 </div>
-                <PrimaryButton accent={teamAccent(draft.team)} onClick={()=>setDraft({...draft,gpsCaptured:true})}><MapPin size={16} /> Share my location</PrimaryButton>
+                <PrimaryButton accent={accent} disabled={gpsLoading} onClick={async ()=>{
+                  setGpsLoading(true);
+                  setGpsError(null);
+                  try {
+                    const loc = await getLocation();
+                    setDraft({...draft, gpsCaptured:true, checkInLat:loc.lat, checkInLng:loc.lng, checkInAccuracy:loc.accuracy, checkInLocationStatus:"ok"});
+                  } catch(err) {
+                    if (err === "denied") {
+                      setGpsError("denied");
+                    } else {
+                      // timeout — allow through, mark unavailable
+                      setDraft({...draft, gpsCaptured:true, checkInLat:null, checkInLng:null, checkInAccuracy:null, checkInLocationStatus:"unavailable"});
+                    }
+                  }
+                  setGpsLoading(false);
+                }}>
+                  <MapPin size={16} /> {gpsLoading ? "Getting location…" : "Share my location"}
+                </PrimaryButton>
               </>
             ) : (
               <>
                 <CheckCircle2 size={40} color={GREEN} />
-                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 20px" }}>Location captured</div>
-                <PrimaryButton accent={teamAccent(draft.team)} onClick={()=>setScreen("checkinVehicle")}>Continue</PrimaryButton>
+                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px" }}>Location captured</div>
+                {draft.checkInLat ? (
+                  <div style={{ fontSize:12, color:SLATE, marginBottom:20 }}>GPS fix · ±{draft.checkInAccuracy}m accuracy</div>
+                ) : (
+                  <div style={{ fontSize:12, color:AMBER_DARK, marginBottom:20 }}>Location unavailable — check-in will proceed without GPS</div>
+                )}
+                <PrimaryButton accent={accent} onClick={()=>setScreen("checkinVehicle")}>Continue</PrimaryButton>
               </>
             )}
           </div>
@@ -2841,37 +2949,9 @@ export default function AimflowMasterApp() {
             <span>⚠️ You already have a job logged at this site today. Are you sure this is a different job?</span>
           </div>
         )}
-        {gpsError === "denied" && (
-          <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}>
-            <AlertTriangle size={16} style={{ flexShrink:0, marginTop:1 }} />
-            <span><strong>Location access required.</strong> Please enable location permissions for Opsflow in your phone settings, then try again.</span>
-          </div>
-        )}
-        <PrimaryButton accent={accent} disabled={!draft.jobSite?.trim() || gpsLoading || gpsError === "denied"} onClick={async ()=>{
-          setGpsLoading(true);
-          setGpsError(null);
-          let locationData = null;
-          let locationStatus = "unavailable";
-          try {
-            locationData = await getLocation();
-            locationStatus = "ok";
-          } catch(err) {
-            if (err === "denied") {
-              setGpsLoading(false);
-              setGpsError("denied");
-              return; // hard block — must enable permissions
-            }
-            // timeout or unavailable — allow check-in anyway
-            locationStatus = "unavailable";
-          }
-          setGpsLoading(false);
+        <PrimaryButton accent={accent} disabled={!draft.jobSite?.trim()} onClick={()=>{
           const checkInTime = nowFn();
-          const checkinRecord = { ...draft, checkInTime, id:`active-${Date.now()}`,
-            checkInLat: locationData?.lat || null,
-            checkInLng: locationData?.lng || null,
-            checkInAccuracy: locationData?.accuracy || null,
-            checkInLocationStatus: locationStatus,
-          };
+          const checkinRecord = { ...draft, checkInTime, id:`active-${Date.now()}` };
           const rawCrew = [...new Set(Object.values(draft.crewByVehicle||{}).flat())];
           const casualNames = Object.values(draft.crewCustomNames||{}).flat().map((n)=>n.trim()).filter(Boolean);
           const allCrew = [...rawCrew.filter((n)=>n!==CASUAL_LABOUR_OPTION), ...casualNames];
@@ -2881,7 +2961,7 @@ export default function AimflowMasterApp() {
           setDraft(emptyDraft());
           setScreen("checkinDone");
         }}>
-          {gpsLoading ? "Getting location…" : <><Check size={16} /> Confirm check-in</>}
+          <Check size={16} /> Confirm check-in
         </PrimaryButton>
       </Shell>
     );
@@ -2927,8 +3007,70 @@ export default function AimflowMasterApp() {
             <span>⚠️ This job has exceeded 12 hours. Your supervisor and admin have been notified.</span>
           </div>
         )}
-        <PrimaryButton accent={teamAccent(myActiveJob.team)} onClick={()=>setScreen("checkoutDetails")}><LogOut size={16} /> Start check-out</PrimaryButton>
+        <PrimaryButton accent={teamAccent(myActiveJob.team)} onClick={()=>setScreen("checkoutGps")}><LogOut size={16} /> Start check-out</PrimaryButton>
         <button onClick={()=>setScreen("landing")} style={{ width:"100%", padding:13, borderRadius:12, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Not yet — go back</button>
+      </Shell>
+    );
+  }
+
+  if (screen === "checkoutGps") {
+    if (!myActiveJob) { setScreen("landing"); return null; }
+    const accent = teamAccent(myActiveJob.team);
+    return (
+      <Shell>
+        <Header title="Check out" onBack={()=>goBack("checkoutGreet")} accent={accent} />
+        {isBeta ? (
+          <div style={{ textAlign:"center", padding:"20px 0" }}>
+            <CheckCircle2 size={40} color={GREEN} />
+            <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 20px" }}>Beta mode — location skipped</div>
+            <PrimaryButton accent={PURPLE} onClick={()=>setScreen("checkoutDetails")}>Continue</PrimaryButton>
+          </div>
+        ) : (
+          <div style={{ textAlign:"center", padding:"20px 0" }}>
+            {gpsError === "denied" ? (
+              <>
+                <AlertTriangle size={40} color={RED} />
+                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px", color:RED }}>Location access denied</div>
+                <div style={{ fontSize:13, color:SLATE, marginBottom:16 }}>Please enable location permissions for Opsflow in your phone settings, then try again.</div>
+                <PrimaryButton accent={RED} onClick={()=>setGpsError(null)}>Try again</PrimaryButton>
+              </>
+            ) : !checkoutDraft.checkOutLocationStatus ? (
+              <>
+                <MapPin size={40} color={accent} />
+                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px" }}>Confirm your location</div>
+                <div style={{ fontSize:13, color:SLATE, marginBottom:20 }}>Share your check-out location before proceeding</div>
+                <PrimaryButton accent={accent} disabled={gpsLoading} onClick={async ()=>{
+                  setGpsLoading(true);
+                  setGpsError(null);
+                  try {
+                    const loc = await getLocation();
+                    setCheckoutDraft({...checkoutDraft, checkOutLat:loc.lat, checkOutLng:loc.lng, checkOutAccuracy:loc.accuracy, checkOutLocationStatus:"ok"});
+                  } catch(err) {
+                    if (err === "denied") {
+                      setGpsError("denied");
+                    } else {
+                      setCheckoutDraft({...checkoutDraft, checkOutLat:null, checkOutLng:null, checkOutAccuracy:null, checkOutLocationStatus:"unavailable"});
+                    }
+                  }
+                  setGpsLoading(false);
+                }}>
+                  <MapPin size={16} /> {gpsLoading ? "Getting location…" : "Share my location"}
+                </PrimaryButton>
+              </>
+            ) : (
+              <>
+                <CheckCircle2 size={40} color={GREEN} />
+                <div style={{ fontSize:15, fontWeight:700, margin:"14px 0 6px" }}>Location captured</div>
+                {checkoutDraft.checkOutLat ? (
+                  <div style={{ fontSize:12, color:SLATE, marginBottom:20 }}>GPS fix · ±{checkoutDraft.checkOutAccuracy}m accuracy</div>
+                ) : (
+                  <div style={{ fontSize:12, color:AMBER_DARK, marginBottom:20 }}>Location unavailable — check-out will proceed without GPS</div>
+                )}
+                <PrimaryButton accent={accent} onClick={()=>setScreen("checkoutDetails")}>Continue</PrimaryButton>
+              </>
+            )}
+          </div>
+        )}
       </Shell>
     );
   }
@@ -3024,29 +3166,42 @@ export default function AimflowMasterApp() {
           ["Remarks", checkoutDraft.remarks||"NIL"],
           ["Hours on site", `${hours} hrs`],
         ]} />
-        {gpsError === "denied" && (
-          <div style={{ display:"flex", gap:8, background:RED_LIGHT, borderRadius:11, padding:"11px 13px", marginBottom:14, fontSize:12, color:RED }}>
-            <AlertTriangle size={16} style={{ flexShrink:0, marginTop:1 }} />
-            <span><strong>Location access required.</strong> Please enable location permissions for Opsflow in your phone settings, then try again.</span>
+        {/* Geofence warning popup */}
+        {geofenceWarning && (
+          <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", zIndex:9998, display:"flex", alignItems:"center", justifyContent:"center", padding:"0 20px" }}>
+            <div style={{ background:"white", borderRadius:16, padding:20, width:"100%", maxWidth:380 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:12 }}>
+                <span style={{ fontSize:22 }}>{geofenceWarning.flag === "red" ? "🔴" : "🟡"}</span>
+                <div style={{ fontSize:15, fontWeight:700, color:geofenceWarning.flag === "red" ? RED : AMBER_DARK }}>
+                  {geofenceWarning.flag === "red" ? "Location out of range" : "Location differs from check-in"}
+                </div>
+              </div>
+              <div style={{ fontSize:13, color:SLATE, lineHeight:1.6, marginBottom:16 }}>
+                Your check-out location is <strong>{formatDistance(geofenceWarning.distanceM)}</strong> from your check-in location.
+                {geofenceWarning.flag === "red"
+                  ? " This is significantly outside the expected range and will be flagged for supervisor review."
+                  : " This will be flagged for supervisor review."}
+              </div>
+              <div style={{ fontSize:11.5, color:SLATE_LIGHT, fontStyle:"italic", marginBottom:16 }}>
+                Your supervisor will be able to see this flag on the job record. Proceed only if this is correct.
+              </div>
+              <div style={{ display:"flex", gap:8 }}>
+                <button onClick={()=>setGeofenceWarning(null)} style={{ flex:1, padding:11, borderRadius:10, border:`1px solid ${BORDER}`, background:"white", color:SLATE, fontSize:13, fontWeight:600, cursor:"pointer" }}>Go back</button>
+                <button onClick={()=>{
+                  const completed = geofenceWarning.pendingJob;
+                  setGeofenceWarning(null);
+                  if (isBeta) { setBetaJobHistory((p)=>[completed,...p]); setBetaActiveJobs((p)=>p.filter((j)=>j.checker!==session.name)); }
+                  else { addJob(completed); clearActiveJob(session.name); }
+                  setDraft(emptyDraft()); setCheckoutDraft(emptyCheckout());
+                  setLastCompletedJob(completed);
+                  setScreen("checkoutDone");
+                }} style={{ flex:1, padding:11, borderRadius:10, border:"none", background:geofenceWarning.flag === "red" ? RED : AMBER, color:"white", fontSize:13, fontWeight:700, cursor:"pointer" }}>Proceed anyway</button>
+              </div>
+            </div>
           </div>
         )}
-        <PrimaryButton accent={accent} disabled={gpsLoading || gpsError === "denied"} onClick={async ()=>{
-          setGpsLoading(true);
-          setGpsError(null);
-          let locationData = null;
-          let locationStatus = "unavailable";
-          try {
-            locationData = await getLocation();
-            locationStatus = "ok";
-          } catch(err) {
-            if (err === "denied") {
-              setGpsLoading(false);
-              setGpsError("denied");
-              return;
-            }
-            locationStatus = "unavailable";
-          }
-          setGpsLoading(false);
+        <PrimaryButton accent={accent} onClick={()=>{
+          // Build the completed job record using pre-captured GPS from checkoutDraft
           const completed = {
             id:`job-${Date.now()}`, team:myActiveJob.team, jobSite:myActiveJob.jobSite, checker:myActiveJob.checker,
             checkInTime:myActiveJob.checkInTime, checkOutTime, hours,
@@ -3054,24 +3209,32 @@ export default function AimflowMasterApp() {
             crewByVehicle:myActiveJob.crewByVehicle||{},
             serviceLines:checkoutDraft.serviceLines, jobsheet:checkoutDraft.jobsheet,
             pubDisposal:checkoutDraft.pubDisposal, remarks:checkoutDraft.remarks,
-            // Check-in location (carried from active job record)
             checkInLat: myActiveJob.checkInLat || null,
             checkInLng: myActiveJob.checkInLng || null,
             checkInAccuracy: myActiveJob.checkInAccuracy || null,
             checkInLocationStatus: myActiveJob.checkInLocationStatus || "unavailable",
-            // Check-out location (just captured)
-            checkOutLat: locationData?.lat || null,
-            checkOutLng: locationData?.lng || null,
-            checkOutAccuracy: locationData?.accuracy || null,
-            checkOutLocationStatus: locationStatus,
+            checkOutLat: checkoutDraft.checkOutLat || null,
+            checkOutLng: checkoutDraft.checkOutLng || null,
+            checkOutAccuracy: checkoutDraft.checkOutAccuracy || null,
+            checkOutLocationStatus: checkoutDraft.checkOutLocationStatus || "unavailable",
           };
+          // Compute geofence flag
+          const { flag, distanceM } = computeLocationFlag(completed);
+          completed.locationFlag = flag || "ok";
+          completed.locationDistanceM = distanceM;
+          // Show popup if amber or red
+          if (flag === "amber" || flag === "red") {
+            setGeofenceWarning({ flag, distanceM, pendingJob: completed });
+            return;
+          }
+          // No warning needed — save directly
           if (isBeta) { setBetaJobHistory((p)=>[completed,...p]); setBetaActiveJobs((p)=>p.filter((j)=>j.checker!==session.name)); }
           else { addJob(completed); clearActiveJob(session.name); }
           setDraft(emptyDraft()); setCheckoutDraft(emptyCheckout());
           setLastCompletedJob(completed);
           setScreen("checkoutDone");
         }}>
-          {gpsLoading ? "Getting location…" : <><Check size={16} /> Confirm check-out</>}
+          <Check size={16} /> Confirm check-out
         </PrimaryButton>
       </Shell>
     );
@@ -3772,6 +3935,7 @@ export default function AimflowMasterApp() {
                 <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
                   <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{j.hours} hrs</span>
                   {ot>0 && <span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:premium?RED_LIGHT:GREEN_LIGHT, color:premium?RED:GREEN_DARK }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span>}
+                  <LocationFlagBadge job={j} />
                 </div>
                 <JobDetailDropdown job={j} />
               </div>
@@ -3880,13 +4044,14 @@ export default function AimflowMasterApp() {
                   <span style={{ fontSize:11, color:premium?RED:SLATE_LIGHT, fontWeight:premium?700:400 }}>{dayType}</span>
                 </div>
                 <div style={{ fontSize:14.5, fontWeight:700, color:j.jobSite?INK:SLATE_LIGHT, marginBottom:2, fontStyle:j.jobSite?"normal":"italic" }}>{j.jobSite||"No site recorded"}</div>
-                <div style={{ fontSize:12, color:SLATE, marginBottom:10 }}>
+                <div style={{ fontSize:12, color:SLATE, marginBottom:8 }}>
                   {new Date(j.checkInTime).toLocaleDateString("en-SG",{day:"2-digit",month:"short"})}
                   {" · "}{new Date(j.checkInTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
                   {" – "}{new Date(j.checkOutTime).toLocaleTimeString("en-SG",{hour:"2-digit",minute:"2-digit"})}
                   {" · "}<strong>{j.hours} hrs</strong>
                   {ot>0 && isAdminOrSup && <> · <span style={{ color:premium?RED:GREEN_DARK, fontWeight:700 }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span></>}
                 </div>
+                <LocationFlagBadge job={j} />
                 {j.vehicles?.length>0 && <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:8 }}>{j.vehicles.map((v)=><span key={v} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}><Truck size={11} color="#6B7280" />{v}</span>)}</div>}
                 <div style={{ fontSize:10.5, fontWeight:700, color:SLATE, marginBottom:6, textTransform:"uppercase", letterSpacing:0.3 }}>Personnel</div>
                 <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
@@ -3980,9 +4145,10 @@ export default function AimflowMasterApp() {
                     ))}
                   </div>
                 )}
-                <div style={{ display:"flex", gap:6 }}>
+                <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
                   <span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:"#374151" }}>{j.hours} hrs</span>
                   {otVisible?(ot>0&&<span style={{ fontSize:11, fontWeight:700, padding:"3px 8px", borderRadius:6, background:premium?RED_LIGHT:GREEN_LIGHT, color:premium?RED:GREEN_DARK }}>{ot.toFixed(1)} OT{premium?" (2×)":""}</span>):<span style={{ fontSize:11, fontWeight:600, padding:"3px 8px", borderRadius:6, background:CANVAS, color:SLATE_LIGHT, display:"flex", alignItems:"center", gap:4 }}><Lock size={10} /> OT hidden</span>}
+                  <LocationFlagBadge job={j} />
                 </div>
                 <JobDetailDropdown job={j} />
               </div>
